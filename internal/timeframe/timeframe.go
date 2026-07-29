@@ -18,8 +18,9 @@ type Timeframe struct {
 }
 
 var (
-	OneHour = Timeframe{N: 1, Unit: Hour}
-	OneDay  = Timeframe{N: 1, Unit: Day}
+	OneMinute = Timeframe{N: 1, Unit: Minute}
+	OneHour   = Timeframe{N: 1, Unit: Hour}
+	OneDay    = Timeframe{N: 1, Unit: Day}
 )
 
 // String is used as an on-disk cache key, e.g. "1Hour", "1Day".

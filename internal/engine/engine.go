@@ -42,7 +42,11 @@ type Engine struct {
 func New(cfg *config.Config, b *broker.Broker) (*Engine, error) {
 	params := strategy.DefaultDailyParams()
 	lookbackDays := 120 // enough calendar days for EMA(50)/RSI(14)/ATR(14) to settle on daily bars
-	if cfg.Timeframe.Unit == timeframe.Hour {
+	switch cfg.Timeframe.Unit {
+	case timeframe.Minute:
+		params = strategy.DefaultMinuteParams()
+		lookbackDays = 5 // ~1000+ one-minute bars, comfortably past EMA(60)'s settling window
+	case timeframe.Hour:
 		params = strategy.DefaultHourlyParams()
 		lookbackDays = 30 // ~195 hourly bars, comfortably past EMA(21)'s settling window
 	}
@@ -75,6 +79,7 @@ func New(cfg *config.Config, b *broker.Broker) (*Engine, error) {
 // is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
 	slog.Info("engine starting", "watchlist", e.cfg.Watchlist, "poll_interval", e.cfg.PollInterval)
+
 	for {
 		select {
 		case <-ctx.Done():

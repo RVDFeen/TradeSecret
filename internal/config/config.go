@@ -124,8 +124,10 @@ func Load() (*Config, error) {
 		cfg.Timeframe = timeframe.OneHour
 	case "daily", "day":
 		cfg.Timeframe = timeframe.OneDay
+	case "minute", "min", "1min":
+		cfg.Timeframe = timeframe.OneMinute
 	default:
-		return nil, fmt.Errorf("invalid STRATEGY_TIMEFRAME %q: must be \"hourly\" or \"daily\"", os.Getenv("STRATEGY_TIMEFRAME"))
+		return nil, fmt.Errorf("invalid STRATEGY_TIMEFRAME %q: must be \"minute\", \"hourly\", or \"daily\"", os.Getenv("STRATEGY_TIMEFRAME"))
 	}
 
 	cfg.RiskPerTradePct = getFloat("RISK_PER_TRADE_PCT", 1.0)

@@ -65,6 +65,24 @@ func DefaultHourlyParams() Params {
 	}
 }
 
+// DefaultMinuteParams is the 1-minute-bar counterpart — the finest bar
+// resolution Alpaca's bars API offers, and the fastest/noisiest version of
+// this strategy. Starting point only: needs the same backtest-sweep
+// validation the hourly/daily defaults got before it should be trusted.
+func DefaultMinuteParams() Params {
+	return Params{
+		EMAFastPeriod:    20,
+		EMASlowPeriod:    60,
+		RSIPeriod:        14,
+		RSILowerBound:    40,
+		RSIUpperBound:    70,
+		ATRPeriod:        14,
+		StopATRMult:      2.0,
+		TakeATRMult:      3.0,
+		DisableTrendExit: true,
+	}
+}
+
 type Signal struct {
 	Price       float64
 	EMAFast     float64

@@ -103,7 +103,7 @@ func backtestCmd(args []string) {
 	stopMult := fs.Float64("stop-mult", 0, "override stop-loss ATR multiple (0 = default)")
 	takeMult := fs.Float64("take-mult", 0, "override take-profit ATR multiple (0 = default)")
 	noTrendExit := fs.Bool("no-trend-exit", false, "disable the early trend-flip exit; rely only on the stop/take bracket")
-	timeframeFlag := fs.String("timeframe", "", "bar resolution: \"hourly\" or \"daily\" (default: STRATEGY_TIMEFRAME from .env)")
+	timeframeFlag := fs.String("timeframe", "", "bar resolution: \"minute\", \"hourly\", or \"daily\" (default: STRATEGY_TIMEFRAME from .env)")
 	fs.Parse(args)
 
 	cfg, err := config.Load()
@@ -113,6 +113,8 @@ func backtestCmd(args []string) {
 	}
 	tf := cfg.Timeframe
 	switch strings.ToLower(*timeframeFlag) {
+	case "minute", "min", "1min":
+		tf = timeframe.OneMinute
 	case "hourly", "hour":
 		tf = timeframe.OneHour
 	case "daily", "day":
@@ -120,7 +122,7 @@ func backtestCmd(args []string) {
 	case "":
 		// keep cfg.Timeframe
 	default:
-		slog.Error("invalid --timeframe, must be \"hourly\" or \"daily\"", "value", *timeframeFlag)
+		slog.Error("invalid --timeframe, must be \"minute\", \"hourly\", or \"daily\"", "value", *timeframeFlag)
 		os.Exit(1)
 	}
 	b := broker.New(cfg)
@@ -149,9 +151,12 @@ func backtestCmd(args []string) {
 		DailyLossLimitPct: cfg.DailyLossLimitPct,
 	}
 	var params strategy.Params
-	if tf.Unit == timeframe.Hour {
+	switch tf.Unit {
+	case timeframe.Minute:
+		params = strategy.DefaultMinuteParams()
+	case timeframe.Hour:
 		params = strategy.DefaultHourlyParams()
-	} else {
+	default:
 		params = strategy.DefaultDailyParams()
 	}
 	if *emaFast > 0 {
