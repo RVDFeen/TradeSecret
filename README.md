@@ -139,23 +139,30 @@ Two modes, `UNIVERSE_MODE` in `.env`:
 ### Staying inside Alpaca's rate limit
 
 A bigger universe means more API calls per tick, and Alpaca's free tier caps
-at 200/min. `internal/ratelimit` derives two numbers from `MAX_POSITIONS` and
-`POLL_INTERVAL` instead of guessing:
+at 200/min. `internal/ratelimit` derives two numbers instead of guessing —
+both use 75% of the documented limit, leaving headroom for bursts within a
+tick and anything else sharing the account:
 
-- **A hard poll-interval floor** (`config.Load`): protecting existing
-  positions and checking account/fill state is safety-critical and must run
-  in full every tick, so `POLL_INTERVAL` can never be set fast enough to risk
-  not affording that — it gets silently raised to the floor (with a warning)
-  if it's set below. For `MAX_POSITIONS=5` that floor is ~9 seconds.
+- **A hard poll-interval floor** (`config.Load`): checking account/fill state
+  and whether positions need re-protecting is safety-critical and must run in
+  full every tick, so `POLL_INTERVAL` can never be set fast enough to risk not
+  affording that — it gets silently raised to the floor (with a warning) if
+  set below. This floor is a small fixed number (~3s) independent of
+  `MAX_POSITIONS`: the checks it covers are single batched calls regardless of
+  how many positions exist.
 - **A per-tick candidate-scan budget** (`engine.tick`): scanning candidates
   for *new* entries is the part that actually scales with universe size, so
   it's the part that gets throttled when budget is tight — never position
   protection, which already ran in full before candidate-scanning even
-  starts. If the universe is bigger than what's affordable this tick, the
+  starts. Crucially, this budget is computed from what protection *actually*
+  cost this specific tick (almost always ~0 positions needed fixing), not a
+  worst-case assumption that every held position needs it — that assumption
+  alone scales with `MAX_POSITIONS` and can silently eat the entire budget
+  once it's more than a handful, even though real protection cost almost
+  never does. If the universe is bigger than what's affordable this tick, the
   engine scans as many as it safely can and rotates through the remainder
   across subsequent ticks, so full coverage still happens over time, just not
-  all at once. Both numbers use 75% of the documented limit, leaving headroom
-  for bursts within a tick and anything else sharing the account.
+  all at once.
 
 ## Setup
 

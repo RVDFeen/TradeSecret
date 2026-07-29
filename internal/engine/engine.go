@@ -135,8 +135,12 @@ func (e *Engine) RunOnce(ctx context.Context) {
 
 func (e *Engine) tick(ctx context.Context) {
 	// Runs first and unconditionally: every held position — including ones
-	// this bot didn't open itself — must have a live protective stop.
-	e.ensurePositionsProtected()
+	// this bot didn't open itself — must have a live protective stop. Track
+	// the real cost so candidate-scanning below is budgeted off what this
+	// actually spent, not a worst-case guess.
+	callsSpent := ratelimit.AlwaysEveryTickCalls
+	fixed := e.ensurePositionsProtected()
+	callsSpent += ratelimit.PerUnprotectedPositionCalls * float64(fixed)
 
 	// Also unconditional: record every fill since the last tick, including
 	// ones from a stop-loss/take-profit that triggered server-side while this
@@ -159,7 +163,8 @@ func (e *Engine) tick(ctx context.Context) {
 		// CancelAllOrders just stripped every position's protective stop too
 		// (they're the same open orders); reattach immediately rather than
 		// leaving positions naked until the next poll.
-		e.ensurePositionsProtected()
+		fixedAgain := e.ensurePositionsProtected()
+		callsSpent += ratelimit.PerUnprotectedPositionCalls * float64(fixedAgain)
 		e.haltedToday = true
 	}
 
@@ -208,10 +213,12 @@ func (e *Engine) tick(ctx context.Context) {
 	}
 
 	// Rate-limit budget: only scan as many candidates this tick as is safe
-	// at the current poll interval, rotating through the rest so everything
-	// still gets covered over subsequent ticks. Position protection above
-	// was never part of this budget and always runs in full regardless.
-	maxScan := ratelimit.MaxCandidatesPerTick(e.cfg.PollInterval, e.cfg.MaxPositions)
+	// given what's actually been spent so far plus a reserve for filling
+	// every remaining slot, rotating through the rest so everything still
+	// gets covered over subsequent ticks. Position protection above was
+	// never part of this budget and always ran in full regardless.
+	availableSlots := e.risk.MaxPositions - len(positions)
+	maxScan := ratelimit.MaxCandidatesPerTick(e.cfg.PollInterval, callsSpent, availableSlots)
 	window, rest := rotatingWindow(toScan, e.scanOffset, maxScan)
 	if len(rest) > 0 {
 		slog.Info("rate-limit budget: scanning a subset of candidates this tick, rotating through the rest",
@@ -411,15 +418,17 @@ func (e *Engine) enterPosition(symbol string, sig strategy.Signal, acc broker.Ac
 // of whether this bot placed it — and attaches an ATR-based protective
 // stop/take-profit OCO to any that don't already have a live stop order.
 // This is what keeps a manually-opened position, or one whose bracket leg got
-// cancelled some other way, from sitting completely unprotected.
-func (e *Engine) ensurePositionsProtected() {
+// cancelled some other way, from sitting completely unprotected. Returns how
+// many positions it actually attempted to fix, so the caller can budget the
+// rest of the tick's rate-limit usage off the real cost, not a guess.
+func (e *Engine) ensurePositionsProtected() int {
 	positions, err := e.broker.GetOpenPositions()
 	if err != nil {
 		slog.Error("get open positions failed", "err", err)
-		return
+		return 0
 	}
 	if len(positions) == 0 {
-		return
+		return 0
 	}
 
 	symbols := make([]string, len(positions))
@@ -429,16 +438,19 @@ func (e *Engine) ensurePositionsProtected() {
 	protected, err := e.broker.HasLiveProtectiveStop(symbols)
 	if err != nil {
 		slog.Error("check protective stops failed", "err", err)
-		return
+		return 0
 	}
 
+	fixed := 0
 	for _, pos := range positions {
 		if protected[pos.Symbol] {
 			continue
 		}
 		slog.Warn("position has no live protective stop — attaching one now", "symbol", pos.Symbol, "qty", pos.Qty)
 		e.attachProtectiveStop(pos)
+		fixed++
 	}
+	return fixed
 }
 
 func (e *Engine) attachProtectiveStop(pos broker.HeldPosition) {

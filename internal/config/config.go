@@ -164,13 +164,15 @@ func Load() (*Config, error) {
 
 	// Hard safety floor: position-protection and account-state checks are
 	// non-negotiable every tick, so POLL_INTERVAL can never go fast enough to
-	// risk not being able to afford them, regardless of timeframe, universe
-	// size, or an explicit override. Candidate scanning (which does scale
-	// with universe size) is throttled separately in the engine instead of
-	// by slowing this down further — see internal/ratelimit.
-	if floor := ratelimit.MinPollInterval(cfg.MaxPositions); cfg.PollInterval < floor {
-		fmt.Fprintf(os.Stderr, "WARNING: POLL_INTERVAL %s is below the rate-limit safety floor for MAX_POSITIONS=%d (%s) — raising it to the floor.\n",
-			cfg.PollInterval, cfg.MaxPositions, floor)
+	// risk not being able to afford them. This floor doesn't depend on
+	// MAX_POSITIONS or universe size — those calls are single batched
+	// requests regardless of how many positions/symbols they cover.
+	// Candidate scanning (which does scale with universe size) is throttled
+	// separately in the engine instead of by slowing this down further —
+	// see internal/ratelimit.
+	if floor := ratelimit.MinPollInterval(); cfg.PollInterval < floor {
+		fmt.Fprintf(os.Stderr, "WARNING: POLL_INTERVAL %s is below the rate-limit safety floor (%s) — raising it to the floor.\n",
+			cfg.PollInterval, floor)
 		cfg.PollInterval = floor
 	}
 
