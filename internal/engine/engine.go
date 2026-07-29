@@ -5,15 +5,24 @@ package engine
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"tradebot/internal/bar"
 	"tradebot/internal/broker"
 	"tradebot/internal/config"
+	"tradebot/internal/decisionlog"
 	"tradebot/internal/indicators"
 	"tradebot/internal/risk"
 	"tradebot/internal/strategy"
 	"tradebot/internal/timeframe"
+	"tradebot/internal/tradelog"
+)
+
+const (
+	tradeLogPath    = "data/trades.jsonl"
+	decisionLogPath = "data/decisions.jsonl"
 )
 
 type Engine struct {
@@ -22,18 +31,28 @@ type Engine struct {
 	risk         risk.Manager
 	params       strategy.Params
 	lookbackDays int // calendar days of history to fetch per evaluation
+	tradeLog     *tradelog.Logger
+	decisionLog  *decisionlog.Logger
 
 	dayStartEquity float64
 	dayStartDate   string
 	haltedToday    bool
 }
 
-func New(cfg *config.Config, b *broker.Broker) *Engine {
+func New(cfg *config.Config, b *broker.Broker) (*Engine, error) {
 	params := strategy.DefaultDailyParams()
 	lookbackDays := 120 // enough calendar days for EMA(50)/RSI(14)/ATR(14) to settle on daily bars
 	if cfg.Timeframe.Unit == timeframe.Hour {
 		params = strategy.DefaultHourlyParams()
 		lookbackDays = 30 // ~195 hourly bars, comfortably past EMA(21)'s settling window
+	}
+
+	if err := os.MkdirAll(filepath.Dir(tradeLogPath), 0o755); err != nil {
+		return nil, err
+	}
+	tl, err := tradelog.Open(tradeLogPath)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Engine{
@@ -47,7 +66,9 @@ func New(cfg *config.Config, b *broker.Broker) *Engine {
 		},
 		params:       params,
 		lookbackDays: lookbackDays,
-	}
+		tradeLog:     tl,
+		decisionLog:  decisionlog.Open(decisionLogPath),
+	}, nil
 }
 
 // Run blocks, polling at cfg.PollInterval while the market is open, until ctx
@@ -101,6 +122,11 @@ func (e *Engine) tick(ctx context.Context) {
 	// this bot didn't open itself — must have a live protective stop.
 	e.ensurePositionsProtected()
 
+	// Also unconditional: record every fill since the last tick, including
+	// ones from a stop-loss/take-profit that triggered server-side while this
+	// bot wasn't even running to see it happen.
+	e.logNewFills()
+
 	acc, err := e.broker.GetAccount()
 	if err != nil {
 		slog.Error("get account failed", "err", err)
@@ -134,11 +160,17 @@ func (e *Engine) tick(ctx context.Context) {
 
 	if e.haltedToday {
 		slog.Info("halted for the day, skipping new entries", "open_positions", len(positions))
+		for _, symbol := range e.cfg.Watchlist {
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "halted_daily_loss"})
+		}
 		return
 	}
 
 	if !e.risk.CanOpenNewPosition(len(positions)) {
 		slog.Info("max concurrent positions reached, skipping new entries", "open_positions", len(positions))
+		for _, symbol := range e.cfg.Watchlist {
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "max_positions_reached"})
+		}
 		return
 	}
 
@@ -150,9 +182,11 @@ func (e *Engine) tick(ctx context.Context) {
 		}
 
 		if positions[symbol] || openOrders[symbol] {
-			continue // already in or entering this name
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "already_held_or_pending"})
+			continue
 		}
 		if !e.risk.CanOpenNewPosition(len(positions)) {
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "max_positions_reached_mid_tick"})
 			break // filled up mid-loop
 		}
 
@@ -164,27 +198,39 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 	bars, err := e.broker.GetRecentBars(symbol, e.cfg.Timeframe, e.lookbackDays)
 	if err != nil {
 		slog.Error("get bars failed", "symbol", symbol, "err", err)
+		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "bars_fetch_error: " + err.Error()})
 		return
 	}
 	sig, ok := strategy.Evaluate(bars, e.params)
 	if !ok {
 		slog.Warn("not enough bar history to evaluate", "symbol", symbol, "bars", len(bars))
+		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "insufficient_bars"})
 		return
+	}
+	signalDecision := decisionlog.Decision{
+		Symbol: symbol, Price: sig.Price, EMAFast: sig.EMAFast, EMASlow: sig.EMASlow,
+		RSI: sig.RSI, ATR: sig.ATR, Uptrend: decisionlog.Bool(sig.Uptrend), Momentum: decisionlog.Bool(sig.Momentum),
 	}
 	if !sig.ShouldEnter {
 		slog.Debug("no entry signal", "symbol", symbol, "uptrend", sig.Uptrend, "momentum", sig.Momentum, "rsi", sig.RSI)
+		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "no_signal"
+		e.decisionLog.Log(signalDecision)
 		return
 	}
 
 	price, err := e.broker.GetLatestPrice(symbol)
 	if err != nil {
 		slog.Error("get latest price failed", "symbol", symbol, "err", err)
+		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "price_fetch_error: "+err.Error()
+		e.decisionLog.Log(signalDecision)
 		return
 	}
 
 	qty := e.risk.PositionSize(acc.Equity, acc.BuyingPower, price, sig.StopPrice)
 	if qty <= 0 {
 		slog.Info("position size computed to zero, skipping", "symbol", symbol, "price", price, "stop", sig.StopPrice)
+		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "zero_position_size"
+		e.decisionLog.Log(signalDecision)
 		return
 	}
 
@@ -194,9 +240,14 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 	order, err := e.broker.PlaceBracketBuy(symbol, qty, sig.StopPrice, sig.TakePrice)
 	if err != nil {
 		slog.Error("place order failed", "symbol", symbol, "err", err)
+		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "order_place_error: "+err.Error()
+		e.decisionLog.Log(signalDecision)
 		return
 	}
 	slog.Info("order submitted", "symbol", symbol, "order_id", order.ID)
+	signalDecision.Action, signalDecision.Reason = decisionlog.Enter, "signal"
+	signalDecision.Qty, signalDecision.Stop, signalDecision.Take, signalDecision.OrderID = float64(qty), sig.StopPrice, sig.TakePrice, order.ID
+	e.decisionLog.Log(signalDecision)
 }
 
 // ensurePositionsProtected scans every currently held position — regardless
@@ -264,6 +315,39 @@ func (e *Engine) attachProtectiveStop(pos broker.HeldPosition) {
 		return
 	}
 	slog.Info("protective stop attached", "symbol", pos.Symbol, "qty", pos.Qty, "stop", stopPrice, "take", takePrice, "order_id", order.ID)
+}
+
+// logNewFills fetches every fill since the last one recorded and appends
+// them to the persistent trade log, logging each one via slog too. This is
+// the only place fills get recorded: entries logged at order-submission time
+// are intent, not confirmation, and exits (stop-loss/take-profit) happen
+// entirely server-side with no log line at all otherwise.
+func (e *Engine) logNewFills() {
+	since := e.tradeLog.LastTime()
+	if since.IsZero() {
+		since = time.Now().Add(-24 * time.Hour) // first run: don't backfill ancient history
+	}
+
+	fills, err := e.broker.GetFillActivities(since)
+	if err != nil {
+		slog.Error("get fill activities failed", "err", err)
+		return
+	}
+	if len(fills) == 0 {
+		return
+	}
+
+	entries := make([]tradelog.Entry, len(fills))
+	for i, f := range fills {
+		entries[i] = tradelog.Entry{
+			ID: f.ID, Time: f.Time, Symbol: f.Symbol, Side: f.Side,
+			Qty: f.Qty, Price: f.Price, OrderID: f.OrderID,
+		}
+		slog.Info("trade fill", "symbol", f.Symbol, "side", f.Side, "qty", f.Qty, "price", f.Price, "order_id", f.OrderID, "time", f.Time)
+	}
+	if err := e.tradeLog.Append(entries); err != nil {
+		slog.Error("failed to persist trade log", "err", err)
+	}
 }
 
 func (e *Engine) rolloverDayIfNeeded(currentEquity float64) {

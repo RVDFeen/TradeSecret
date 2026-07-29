@@ -73,7 +73,11 @@ func runCmd(args []string) {
 	}
 	slog.Info("connected to Alpaca paper account", "equity", acc.Equity, "buying_power", acc.BuyingPower, "base_url", cfg.BaseURL)
 
-	eng := engine.New(cfg, b)
+	eng, err := engine.New(cfg, b)
+	if err != nil {
+		slog.Error("engine init failed", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

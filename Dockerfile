@@ -18,9 +18,9 @@ RUN apk add --no-cache ca-certificates \
 WORKDIR /app
 COPY --from=build /out/tradebot /app/tradebot
 
-# Bar cache lives here; mount a volume at this path to persist it across
-# container restarts (see docker-compose.yml).
-RUN mkdir -p /app/.cache && chown -R tradebot:tradebot /app
+# Bar cache and the trade log both live here; mount a volume at this path to
+# persist them across container restarts (see docker-compose.yml).
+RUN mkdir -p /app/data && chown -R tradebot:tradebot /app
 USER tradebot
 
 ENTRYPOINT ["/app/tradebot"]

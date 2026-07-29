@@ -56,6 +56,29 @@ as directional evidence of a modest edge, not a guarantee — see
   behavior on restart, because there's no in-memory state to be wrong about;
   it always acts on whatever Alpaca says is true right now.
 
+## Logging
+
+Two append-only JSON Lines files under `data/`, in addition to the normal
+console/`docker compose logs` output:
+
+- **`data/trades.jsonl`** — every actual fill, sourced from Alpaca's own
+  account-activity ledger (not inferred from order status), so it also
+  captures a stop-loss or take-profit firing while the bot wasn't even
+  running to see it happen. One line per fill: symbol, side, qty, price,
+  order ID, timestamp.
+- **`data/decisions.jsonl`** — every decision the engine makes, every tick,
+  for every symbol — not just the ones that turned into trades. Each line has
+  the symbol, `"enter"` or `"skip"`, a reason (`no_signal`,
+  `already_held_or_pending`, `max_positions_reached`, `zero_position_size`,
+  `halted_daily_loss`, `bars_fetch_error`, ...), and for signal-based
+  decisions the full indicator snapshot (EMA fast/slow, RSI, ATR, uptrend,
+  momentum) that drove the call. This is the record to mine later for
+  improving the strategy — e.g. "how often did RSI block an otherwise-good
+  trend?" is a question you can actually answer from this file.
+
+Both survive restarts and are excluded from git (`data/` is gitignored) — back
+them up separately if you want to keep trade history around.
+
 ## Strategy
 
 Timeframe-agnostic logic, with separate tuned parameters per timeframe since
@@ -203,5 +226,8 @@ internal/strategy/     entry/exit signal logic
 internal/risk/         position sizing, daily loss limit, exposure caps
 internal/engine/       live polling loop tying broker+strategy+risk together
 internal/backtest/     historical simulation + performance stats
-internal/cache/        on-disk cache for historical bars
+internal/cache/        on-disk cache for historical bars (data/cache/)
+internal/tradelog/     persistent fill ledger (data/trades.jsonl)
+internal/decisionlog/  persistent record of every decision, traded or not (data/decisions.jsonl)
+internal/timeframe/    bar-resolution type shared by strategy/backtest/cache
 ```

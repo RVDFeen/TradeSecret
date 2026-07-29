@@ -9,7 +9,10 @@ services:
     env_file:
       - .env
     volumes:
-      - tradebot-cache:/app/.cache
+      # Bar cache AND the trade fill log (data/trades.jsonl) both live under
+      # here — back this volume up if you care about trade history surviving
+      # `docker compose down -v`.
+      - tradebot-data:/app/data
     restart: unless-stopped
     # Default: the live paper-trading loop. Override for one-off runs, e.g.:
     #   docker compose run --rm tradebot backtest --years 2 --timeframe hourly
@@ -17,4 +20,4 @@ services:
     command: ["run"]
 
 volumes:
-  tradebot-cache:
+  tradebot-data:

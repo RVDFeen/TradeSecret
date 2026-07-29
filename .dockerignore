@@ -1,4 +1,4 @@
 .git
 .env
-.cache/
+data/
 bin/

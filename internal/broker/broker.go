@@ -207,6 +207,46 @@ func (b *Broker) PlaceBracketBuy(symbol string, qty int64, stopPrice, takePrice 
 	})
 }
 
+type Fill struct {
+	ID      string
+	Time    time.Time
+	Symbol  string
+	Side    string
+	Qty     float64
+	Price   float64
+	OrderID string
+}
+
+// GetFillActivities returns every order fill (partial or complete) strictly
+// after the given time, oldest first. Alpaca's account-activity ledger is the
+// authoritative trade history — it records fills even ones that happened
+// while this bot wasn't running to see the order status change itself.
+func (b *Broker) GetFillActivities(after time.Time) ([]Fill, error) {
+	activities, err := b.trading.GetAccountActivities(alpaca.GetAccountActivitiesRequest{
+		ActivityTypes: []string{"FILL"},
+		After:         after,
+		Direction:     "asc",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get account activities: %w", err)
+	}
+	out := make([]Fill, 0, len(activities))
+	for _, a := range activities {
+		price, _ := a.Price.Float64()
+		qty, _ := a.Qty.Float64()
+		out = append(out, Fill{
+			ID:      a.ID,
+			Time:    a.TransactionTime,
+			Symbol:  a.Symbol,
+			Side:    a.Side,
+			Qty:     qty,
+			Price:   price,
+			OrderID: a.OrderID,
+		})
+	}
+	return out, nil
+}
+
 // PlaceProtectiveOCO attaches a stop-loss/take-profit pair to an EXISTING
 // long position (no entry leg), for positions this bot didn't itself open
 // with PlaceBracketBuy — e.g. opened manually, or left naked after a bracket

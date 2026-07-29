@@ -13,7 +13,7 @@ import (
 	"tradebot/internal/bar"
 )
 
-const dir = ".cache"
+const dir = "data/cache"
 
 // slack tolerates the requested window being a couple of days inside the
 // cached window (weekends/holidays mean bar dates don't line up exactly with
