@@ -1,5 +1,8 @@
 // Package strategy implements a long-only trend + momentum signal with
-// volatility-based stops, evaluated on daily bars.
+// volatility-based stops. It's timeframe-agnostic — the same logic runs on
+// daily bars (swing trading) or hourly bars (faster, more trades), with
+// separate default parameters tuned per timeframe since periods like EMA(20)
+// mean very different things on daily vs. hourly data.
 //
 // Entry: EMA(fast) > EMA(slow) and price > EMA(slow) [uptrend], with RSI in a
 // "healthy momentum" band (not overbought, not falling-knife oversold).
@@ -26,11 +29,12 @@ type Params struct {
 	DisableTrendExit bool
 }
 
-// DefaultParams were chosen by walk-forward backtesting a few candidate
+// DefaultDailyParams were chosen by walk-forward backtesting a few candidate
 // configurations over 1.5-5 year historical windows (see `tradebot backtest`)
 // and picking the one that stayed net-positive with a reasonable Sharpe ratio
 // across all of them, rather than the single best result on any one window.
-func DefaultParams() Params {
+// This is a swing-trading configuration: expect single-digit trades/month.
+func DefaultDailyParams() Params {
 	return Params{
 		EMAFastPeriod:    20,
 		EMASlowPeriod:    50,
@@ -40,6 +44,23 @@ func DefaultParams() Params {
 		ATRPeriod:        14,
 		StopATRMult:      2.5,
 		TakeATRMult:      4.0,
+		DisableTrendExit: true,
+	}
+}
+
+// DefaultHourlyParams is the hourly-bar counterpart, for a faster, more
+// day-trading-flavored version of the same trend+momentum approach. Tuned the
+// same way: backtested across several historical windows, not fit to one.
+func DefaultHourlyParams() Params {
+	return Params{
+		EMAFastPeriod:    9,
+		EMASlowPeriod:    21,
+		RSIPeriod:        14,
+		RSILowerBound:    40,
+		RSIUpperBound:    70,
+		ATRPeriod:        14,
+		StopATRMult:      2.0,
+		TakeATRMult:      3.0,
 		DisableTrendExit: true,
 	}
 }

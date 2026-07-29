@@ -13,8 +13,15 @@ type Manager struct {
 
 // PositionSize returns the number of whole shares to buy given the account
 // equity, entry price, and stop-loss price, so that a stop-out loses no more
-// than RiskPerTradePct of equity, while never exceeding MaxPositionPct of
-// equity in a single name or the available buying power.
+// than RiskPerTradePct of equity. The real driver is that risk calculation —
+// a tighter stop (the market saying this entry is lower-risk right now) sizes
+// bigger, a wider stop sizes smaller, entirely on its own. MaxPositionPct and
+// buying power are not sizing targets, just backstops: MaxPositionPct catches
+// a degenerate case (e.g. a near-zero ATR blowing the risk math up to an
+// absurd share count), and buying power is the hard real-world ceiling on
+// what you can actually afford. Neither should be the thing that binds in
+// normal operation — if MaxPositionPct is routinely capping every trade, it's
+// set too low for the stop distances this strategy actually uses.
 func (m Manager) PositionSize(equity, buyingPower, entryPrice, stopPrice float64) int64 {
 	if entryPrice <= 0 || stopPrice >= entryPrice {
 		return 0

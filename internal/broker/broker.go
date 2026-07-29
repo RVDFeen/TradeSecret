@@ -12,6 +12,7 @@ import (
 
 	"tradebot/internal/bar"
 	"tradebot/internal/config"
+	"tradebot/internal/timeframe"
 )
 
 type Broker struct {
@@ -54,21 +55,19 @@ func (b *Broker) GetAccount() (AccountSnapshot, error) {
 	return AccountSnapshot{Equity: equity, Cash: cash, BuyingPower: bp}, nil
 }
 
-// GetDailyBars returns the last lookbackDays of completed daily bars for symbol,
-// oldest first.
-func (b *Broker) GetDailyBars(symbol string, lookbackDays int) ([]bar.Bar, error) {
-	end := time.Now()
-	start := end.AddDate(0, 0, -lookbackDays*2) // generous padding for weekends/holidays
-
+// GetBarsRange returns completed bars of the given timeframe for symbol
+// between start and end (inclusive), oldest first. Used by the backtester
+// for arbitrary historical windows.
+func (b *Broker) GetBarsRange(symbol string, tf timeframe.Timeframe, start, end time.Time) ([]bar.Bar, error) {
 	bars, err := b.data.GetBars(symbol, marketdata.GetBarsRequest{
-		TimeFrame:  marketdata.OneDay,
+		TimeFrame:  marketdata.NewTimeFrame(tf.N, marketdata.TimeFrameUnit(tf.Unit)),
 		Start:      start,
 		End:        end,
 		Feed:       marketdata.IEX,
 		Adjustment: marketdata.Raw,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get bars for %s: %w", symbol, err)
+		return nil, fmt.Errorf("get %s bars for %s: %w", tf, symbol, err)
 	}
 	out := make([]bar.Bar, len(bars))
 	for i, x := range bars {
@@ -80,39 +79,17 @@ func (b *Broker) GetDailyBars(symbol string, lookbackDays int) ([]bar.Bar, error
 			Close:  x.Close,
 			Volume: float64(x.Volume),
 		}
-	}
-	if len(out) > lookbackDays {
-		out = out[len(out)-lookbackDays:]
 	}
 	return out, nil
 }
 
-// GetDailyBarsRange returns completed daily bars for symbol between start and
-// end (inclusive), oldest first. Used by the backtester for arbitrary
-// historical windows.
-func (b *Broker) GetDailyBarsRange(symbol string, start, end time.Time) ([]bar.Bar, error) {
-	bars, err := b.data.GetBars(symbol, marketdata.GetBarsRequest{
-		TimeFrame:  marketdata.OneDay,
-		Start:      start,
-		End:        end,
-		Feed:       marketdata.IEX,
-		Adjustment: marketdata.Raw,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get bars for %s: %w", symbol, err)
-	}
-	out := make([]bar.Bar, len(bars))
-	for i, x := range bars {
-		out[i] = bar.Bar{
-			Time:   x.Timestamp,
-			Open:   x.Open,
-			High:   x.High,
-			Low:    x.Low,
-			Close:  x.Close,
-			Volume: float64(x.Volume),
-		}
-	}
-	return out, nil
+// GetRecentBars returns the last lookbackDays worth of completed bars of the
+// given timeframe for symbol, oldest first. Used by the live engine, which
+// always wants "up through now".
+func (b *Broker) GetRecentBars(symbol string, tf timeframe.Timeframe, lookbackDays int) ([]bar.Bar, error) {
+	end := time.Now()
+	start := end.AddDate(0, 0, -lookbackDays)
+	return b.GetBarsRange(symbol, tf, start, end)
 }
 
 func (b *Broker) GetLatestPrice(symbol string) (float64, error) {
@@ -134,6 +111,63 @@ func (b *Broker) OpenPositionSymbols() (map[string]bool, error) {
 		out[p.Symbol] = true
 	}
 	return out, nil
+}
+
+type HeldPosition struct {
+	Symbol        string
+	Qty           float64
+	AvgEntryPrice float64
+}
+
+// GetOpenPositions returns every currently held position, regardless of
+// whether this bot was the one that opened it.
+func (b *Broker) GetOpenPositions() ([]HeldPosition, error) {
+	positions, err := b.trading.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HeldPosition, 0, len(positions))
+	for _, p := range positions {
+		qty, _ := p.Qty.Float64()
+		avgEntry, _ := p.AvgEntryPrice.Float64()
+		out = append(out, HeldPosition{Symbol: p.Symbol, Qty: qty, AvgEntryPrice: avgEntry})
+	}
+	return out, nil
+}
+
+// HasLiveProtectiveStop reports, for each of the given symbols, whether it
+// has an unresolved sell-side stop (or stop-limit) order — i.e. an actual
+// stop-loss protecting the position, not just any open order. Alpaca's
+// "status=open" shorthand excludes contingent bracket/OCO legs sitting in a
+// "held" state, so this asks for recent order history instead and checks the
+// lifecycle timestamps directly.
+func (b *Broker) HasLiveProtectiveStop(symbols []string) (map[string]bool, error) {
+	if len(symbols) == 0 {
+		return map[string]bool{}, nil
+	}
+	orders, err := b.trading.GetOrders(alpaca.GetOrdersRequest{
+		Status:    "all",
+		Symbols:   symbols,
+		Limit:     100,
+		Direction: "desc",
+	})
+	if err != nil {
+		return nil, err
+	}
+	protected := make(map[string]bool, len(symbols))
+	for _, o := range orders {
+		if o.Side != alpaca.Sell {
+			continue
+		}
+		if o.Type != alpaca.Stop && o.Type != alpaca.StopLimit {
+			continue
+		}
+		resolved := o.FilledAt != nil || o.ExpiredAt != nil || o.CanceledAt != nil || o.FailedAt != nil
+		if !resolved {
+			protected[o.Symbol] = true
+		}
+	}
+	return protected, nil
 }
 
 // OpenOrderSymbols returns the set of symbols with a currently open (unfilled) order.
@@ -168,6 +202,27 @@ func (b *Broker) PlaceBracketBuy(symbol string, qty int64, stopPrice, takePrice 
 		Type:        alpaca.Market,
 		TimeInForce: alpaca.GTC,
 		OrderClass:  alpaca.Bracket,
+		TakeProfit:  &alpaca.TakeProfit{LimitPrice: &take},
+		StopLoss:    &alpaca.StopLoss{StopPrice: &stop},
+	})
+}
+
+// PlaceProtectiveOCO attaches a stop-loss/take-profit pair to an EXISTING
+// long position (no entry leg), for positions this bot didn't itself open
+// with PlaceBracketBuy — e.g. opened manually, or left naked after a bracket
+// leg was cancelled out from under it.
+func (b *Broker) PlaceProtectiveOCO(symbol string, qty, stopPrice, takePrice float64) (*alpaca.Order, error) {
+	q := decimal.NewFromFloat(qty)
+	stop := *alpaca.RoundLimitPrice(decimal.NewFromFloat(stopPrice), alpaca.Sell)
+	take := *alpaca.RoundLimitPrice(decimal.NewFromFloat(takePrice), alpaca.Sell)
+
+	return b.trading.PlaceOrder(alpaca.PlaceOrderRequest{
+		Symbol:      symbol,
+		Qty:         &q,
+		Side:        alpaca.Sell,
+		Type:        alpaca.Limit,
+		TimeInForce: alpaca.GTC,
+		OrderClass:  alpaca.OCO,
 		TakeProfit:  &alpaca.TakeProfit{LimitPrice: &take},
 		StopLoss:    &alpaca.StopLoss{StopPrice: &stop},
 	})

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"tradebot/internal/timeframe"
 )
 
 type Config struct {
@@ -16,6 +18,7 @@ type Config struct {
 	BaseURL      string
 	Watchlist    []string
 	PollInterval time.Duration
+	Timeframe    timeframe.Timeframe // bar resolution the strategy trades on
 
 	RiskPerTradePct   float64 // % of equity risked per trade (via stop distance)
 	MaxPositionPct    float64 // max % of equity in a single position
@@ -116,8 +119,17 @@ func Load() (*Config, error) {
 	}
 	cfg.PollInterval = d
 
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("STRATEGY_TIMEFRAME"))) {
+	case "", "hourly", "hour":
+		cfg.Timeframe = timeframe.OneHour
+	case "daily", "day":
+		cfg.Timeframe = timeframe.OneDay
+	default:
+		return nil, fmt.Errorf("invalid STRATEGY_TIMEFRAME %q: must be \"hourly\" or \"daily\"", os.Getenv("STRATEGY_TIMEFRAME"))
+	}
+
 	cfg.RiskPerTradePct = getFloat("RISK_PER_TRADE_PCT", 1.0)
-	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 20.0)
+	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 100.0)
 	cfg.MaxPositions = getInt("MAX_POSITIONS", 5)
 	cfg.DailyLossLimitPct = getFloat("DAILY_LOSS_LIMIT_PCT", 3.0)
 

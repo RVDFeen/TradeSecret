@@ -1,15 +1,17 @@
 // Package backtest simulates the strategy+risk logic in internal/strategy and
-// internal/risk over historical daily bars, so the approach can be sanity
-// checked before it ever touches the (paper) broker.
+// internal/risk over historical bars (daily or intraday), so the approach can
+// be sanity checked before it ever touches the (paper) broker.
 //
 // Simplifications, stated up front rather than hidden:
-//   - One fill per day: entries fill at that day's open, exits (stop/take/
-//     trend-flip) fill intraday using that day's high/low/close.
-//   - If both the stop and the take-profit fall inside the same day's
+//   - One fill per bar: entries fill at that bar's open, exits (stop/take/
+//     trend-flip) are checked against that bar's high-low-close.
+//   - If both the stop and the take-profit fall inside the same bar's
 //     high-low range, the stop is assumed to trigger first (conservative).
 //   - No commissions or slippage are modeled (Alpaca charges no commission on
-//     US equities; slippage on liquid names at daily granularity is small but
-//     not zero — real results will differ).
+//     US equities; slippage on liquid names is small but not zero — real
+//     results will differ, more so at intraday timeframes).
+//   - The daily loss limit resets on calendar-day boundaries regardless of
+//     bar timeframe, matching the live engine's behavior.
 package backtest
 
 import (
@@ -58,11 +60,14 @@ type openPosition struct {
 // [start-warmup, end], oldest first) sharing a single cash account of
 // startEquity, and returns the combined result.
 func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, params strategy.Params) Result {
+	// Bars are keyed by exact timestamp, not calendar day: at intraday
+	// timeframes a single day holds many distinct bars.
+	timeKey := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+
 	dateSet := map[string]time.Time{}
 	for _, bars := range symbolBars {
 		for _, b := range bars {
-			key := b.Time.Format("2006-01-02")
-			dateSet[key] = b.Time
+			dateSet[timeKey(b.Time)] = b.Time
 		}
 	}
 	dates := make([]time.Time, 0, len(dateSet))
@@ -71,14 +76,14 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 	}
 	sort.Slice(dates, func(i, j int) bool { return dates[i].Before(dates[j]) })
 
-	// Index bars by symbol+date for O(1) lookup, and keep the full history
-	// slice per symbol so we can pass a prefix to strategy.Evaluate.
+	// Index bars by symbol+timestamp for O(1) lookup, and keep the full
+	// history slice per symbol so we can pass a prefix to strategy.Evaluate.
 	barsBySymbol := symbolBars
 	idxBySymbol := make(map[string]map[string]int, len(symbolBars))
 	for sym, bars := range barsBySymbol {
 		m := make(map[string]int, len(bars))
 		for i, b := range bars {
-			m[b.Time.Format("2006-01-02")] = i
+			m[timeKey(b.Time)] = i
 		}
 		idxBySymbol[sym] = m
 	}
@@ -95,27 +100,44 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 	var curve []EquityPoint
 
 	dayStartEquity := startEquity
+	currentCalendarDay := ""
+	haltedToday := false
 
-	equityNow := func(dateKey string) float64 {
+	// lastPrice forward-fills each held symbol's most recently seen close, so
+	// a bar missing at this exact timestamp (common across symbols at
+	// intraday granularity — not every name trades in every single hour)
+	// doesn't get mark-to-market'd as worthless.
+	lastPrice := map[string]float64{}
+
+	equityNow := func() float64 {
 		total := cash
 		for sym, pos := range positions {
-			idx, ok := idxBySymbol[sym][dateKey]
-			if !ok {
-				continue
+			if price, ok := lastPrice[sym]; ok {
+				total += float64(pos.qty) * price
 			}
-			total += float64(pos.qty) * barsBySymbol[sym][idx].Close
 		}
 		return total
 	}
 
-	haltedToday := false
-
 	for _, date := range dates {
-		dateKey := date.Format("2006-01-02")
-		dayStartEquity = equityNow(dateKey)
-		haltedToday = false
+		dateKey := timeKey(date)
 
-		// 1) Process exits for existing positions using today's bar.
+		// 0) Update the mark-to-market price for every symbol that has a bar
+		// at this exact timestamp (others keep their last known price).
+		for _, sym := range symbols {
+			if idx, ok := idxBySymbol[sym][dateKey]; ok {
+				lastPrice[sym] = barsBySymbol[sym][idx].Close
+			}
+		}
+
+		calendarDay := date.UTC().Format("2006-01-02")
+		if calendarDay != currentCalendarDay {
+			currentCalendarDay = calendarDay
+			dayStartEquity = equityNow()
+			haltedToday = false
+		}
+
+		// 1) Process exits for existing positions using this bar.
 		for sym, pos := range positions {
 			idx, ok := idxBySymbol[sym][dateKey]
 			if !ok {
@@ -149,7 +171,7 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 
 		// 2) Daily loss kill switch: halt new entries for the rest of the day
 		// if the drawdown from today's starting equity already breached the limit.
-		currentEquity := equityNow(dateKey)
+		currentEquity := equityNow()
 		if rm.DailyLossBreached(dayStartEquity, currentEquity) {
 			haltedToday = true
 		}
@@ -168,9 +190,9 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 				if !ok || idx == 0 {
 					continue
 				}
-				// Signal is computed on bars strictly before today (up to
-				// yesterday's close) to avoid lookahead bias; the fill happens
-				// at today's open.
+				// Signal is computed on bars strictly before this one (up to
+				// the previous bar's close) to avoid lookahead bias; the fill
+				// happens at this bar's open.
 				sig, ok := strategy.Evaluate(bars[:idx], params)
 				if !ok || !sig.ShouldEnter {
 					continue
@@ -179,7 +201,7 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 				entryPrice := bars[idx].Open
 				stopPrice := entryPrice - params.StopATRMult*sig.ATR
 				takePrice := entryPrice + params.TakeATRMult*sig.ATR
-				equity := equityNow(dateKey)
+				equity := equityNow()
 				qty := rm.PositionSize(equity, cash, entryPrice, stopPrice)
 				if qty <= 0 {
 					continue
@@ -196,12 +218,12 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 			}
 		}
 
-		curve = append(curve, EquityPoint{Date: date, Equity: equityNow(dateKey)})
+		curve = append(curve, EquityPoint{Date: date, Equity: equityNow()})
 	}
 
 	// Liquidate anything still open at the final available price.
 	if len(dates) > 0 {
-		lastKey := dates[len(dates)-1].Format("2006-01-02")
+		lastKey := timeKey(dates[len(dates)-1])
 		for sym, pos := range positions {
 			idx, ok := idxBySymbol[sym][lastKey]
 			if !ok {
@@ -234,7 +256,10 @@ type Stats struct {
 	SharpeNaive    float64
 }
 
-func (r Result) Stats() Stats {
+// Stats summarizes the result. periodsPerYear annualizes the Sharpe ratio and
+// should match the bar timeframe the backtest was run on (e.g.
+// timeframe.OneDay.PeriodsPerYear() or timeframe.OneHour.PeriodsPerYear()).
+func (r Result) Stats(periodsPerYear float64) Stats {
 	s := Stats{NumTrades: len(r.Trades)}
 	if r.StartEquity <= 0 || len(r.EquityCurve) == 0 {
 		return s
@@ -271,7 +296,7 @@ func (r Result) Stats() Stats {
 		s.WinRatePct = float64(wins) / float64(len(r.Trades)) * 100
 	}
 
-	// Naive daily-return Sharpe (0% risk-free), annualized with sqrt(252).
+	// Naive per-bar-return Sharpe (0% risk-free), annualized for the timeframe.
 	if len(r.EquityCurve) > 1 {
 		rets := make([]float64, 0, len(r.EquityCurve)-1)
 		for i := 1; i < len(r.EquityCurve); i++ {
@@ -294,7 +319,7 @@ func (r Result) Stats() Stats {
 			variance /= float64(len(rets))
 			stddev := math.Sqrt(variance)
 			if stddev > 0 {
-				s.SharpeNaive = mean / stddev * math.Sqrt(252)
+				s.SharpeNaive = mean / stddev * math.Sqrt(periodsPerYear)
 			}
 		}
 	}

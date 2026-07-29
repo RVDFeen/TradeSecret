@@ -7,19 +7,21 @@ import (
 	"log/slog"
 	"time"
 
+	"tradebot/internal/bar"
 	"tradebot/internal/broker"
 	"tradebot/internal/config"
+	"tradebot/internal/indicators"
 	"tradebot/internal/risk"
 	"tradebot/internal/strategy"
+	"tradebot/internal/timeframe"
 )
 
-const lookbackDays = 120 // enough history for EMA(26)/RSI(14)/ATR(14) to settle
-
 type Engine struct {
-	cfg    *config.Config
-	broker *broker.Broker
-	risk   risk.Manager
-	params strategy.Params
+	cfg          *config.Config
+	broker       *broker.Broker
+	risk         risk.Manager
+	params       strategy.Params
+	lookbackDays int // calendar days of history to fetch per evaluation
 
 	dayStartEquity float64
 	dayStartDate   string
@@ -27,6 +29,13 @@ type Engine struct {
 }
 
 func New(cfg *config.Config, b *broker.Broker) *Engine {
+	params := strategy.DefaultDailyParams()
+	lookbackDays := 120 // enough calendar days for EMA(50)/RSI(14)/ATR(14) to settle on daily bars
+	if cfg.Timeframe.Unit == timeframe.Hour {
+		params = strategy.DefaultHourlyParams()
+		lookbackDays = 30 // ~195 hourly bars, comfortably past EMA(21)'s settling window
+	}
+
 	return &Engine{
 		cfg:    cfg,
 		broker: b,
@@ -36,7 +45,8 @@ func New(cfg *config.Config, b *broker.Broker) *Engine {
 			MaxPositions:      cfg.MaxPositions,
 			DailyLossLimitPct: cfg.DailyLossLimitPct,
 		},
-		params: strategy.DefaultParams(),
+		params:       params,
+		lookbackDays: lookbackDays,
 	}
 }
 
@@ -87,6 +97,10 @@ func (e *Engine) RunOnce(ctx context.Context) {
 }
 
 func (e *Engine) tick(ctx context.Context) {
+	// Runs first and unconditionally: every held position — including ones
+	// this bot didn't open itself — must have a live protective stop.
+	e.ensurePositionsProtected()
+
 	acc, err := e.broker.GetAccount()
 	if err != nil {
 		slog.Error("get account failed", "err", err)
@@ -100,6 +114,10 @@ func (e *Engine) tick(ctx context.Context) {
 		if err := e.broker.CancelAllOrders(); err != nil {
 			slog.Error("cancel all orders failed", "err", err)
 		}
+		// CancelAllOrders just stripped every position's protective stop too
+		// (they're the same open orders); reattach immediately rather than
+		// leaving positions naked until the next poll.
+		e.ensurePositionsProtected()
 		e.haltedToday = true
 	}
 
@@ -143,7 +161,7 @@ func (e *Engine) tick(ctx context.Context) {
 }
 
 func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot) {
-	bars, err := e.broker.GetDailyBars(symbol, lookbackDays)
+	bars, err := e.broker.GetRecentBars(symbol, e.cfg.Timeframe, e.lookbackDays)
 	if err != nil {
 		slog.Error("get bars failed", "symbol", symbol, "err", err)
 		return
@@ -179,6 +197,73 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		return
 	}
 	slog.Info("order submitted", "symbol", symbol, "order_id", order.ID)
+}
+
+// ensurePositionsProtected scans every currently held position — regardless
+// of whether this bot placed it — and attaches an ATR-based protective
+// stop/take-profit OCO to any that don't already have a live stop order.
+// This is what keeps a manually-opened position, or one whose bracket leg got
+// cancelled some other way, from sitting completely unprotected.
+func (e *Engine) ensurePositionsProtected() {
+	positions, err := e.broker.GetOpenPositions()
+	if err != nil {
+		slog.Error("get open positions failed", "err", err)
+		return
+	}
+	if len(positions) == 0 {
+		return
+	}
+
+	symbols := make([]string, len(positions))
+	for i, p := range positions {
+		symbols[i] = p.Symbol
+	}
+	protected, err := e.broker.HasLiveProtectiveStop(symbols)
+	if err != nil {
+		slog.Error("check protective stops failed", "err", err)
+		return
+	}
+
+	for _, pos := range positions {
+		if protected[pos.Symbol] {
+			continue
+		}
+		slog.Warn("position has no live protective stop — attaching one now", "symbol", pos.Symbol, "qty", pos.Qty)
+		e.attachProtectiveStop(pos)
+	}
+}
+
+func (e *Engine) attachProtectiveStop(pos broker.HeldPosition) {
+	bars, err := e.broker.GetRecentBars(pos.Symbol, e.cfg.Timeframe, e.lookbackDays)
+	if err != nil {
+		slog.Error("get bars failed while protecting position", "symbol", pos.Symbol, "err", err)
+		return
+	}
+	atr, ok := indicators.ATR(bar.Highs(bars), bar.Lows(bars), bar.Closes(bars), e.params.ATRPeriod)
+	if !ok {
+		slog.Error("not enough bars to compute ATR for protective stop", "symbol", pos.Symbol, "bars", len(bars))
+		return
+	}
+
+	price, err := e.broker.GetLatestPrice(pos.Symbol)
+	if err != nil {
+		slog.Error("get latest price failed while protecting position", "symbol", pos.Symbol, "err", err)
+		return
+	}
+
+	stopPrice := price - e.params.StopATRMult*atr
+	takePrice := price + e.params.TakeATRMult*atr
+	if stopPrice <= 0 || stopPrice >= price || takePrice <= price {
+		slog.Error("computed invalid protective levels, skipping", "symbol", pos.Symbol, "price", price, "stop", stopPrice, "take", takePrice)
+		return
+	}
+
+	order, err := e.broker.PlaceProtectiveOCO(pos.Symbol, pos.Qty, stopPrice, takePrice)
+	if err != nil {
+		slog.Error("failed to attach protective stop", "symbol", pos.Symbol, "err", err)
+		return
+	}
+	slog.Info("protective stop attached", "symbol", pos.Symbol, "qty", pos.Qty, "stop", stopPrice, "take", takePrice, "order_id", order.ID)
 }
 
 func (e *Engine) rolloverDayIfNeeded(currentEquity float64) {
