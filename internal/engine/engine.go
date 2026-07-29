@@ -195,22 +195,30 @@ func (e *Engine) tick(ctx context.Context) {
 			break // filled up mid-loop
 		}
 
-		e.evaluateAndMaybeEnter(symbol, acc)
+		if e.evaluateAndMaybeEnter(symbol, acc) {
+			// Mark it held immediately: len(positions) is what the guard
+			// above checks, and it must reflect entries placed earlier in
+			// this very loop, not just what existed when the tick started —
+			// otherwise the position cap only works across ticks, not within
+			// one, and a single tick can open far more than MAX_POSITIONS.
+			positions[symbol] = true
+		}
 	}
 }
 
-func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot) {
+// evaluateAndMaybeEnter returns true if it placed an entry order.
+func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot) bool {
 	bars, err := e.broker.GetRecentBars(symbol, e.cfg.Timeframe, e.lookbackDays)
 	if err != nil {
 		slog.Error("get bars failed", "symbol", symbol, "err", err)
 		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "bars_fetch_error: " + err.Error()})
-		return
+		return false
 	}
 	sig, ok := strategy.Evaluate(bars, e.params)
 	if !ok {
 		slog.Warn("not enough bar history to evaluate", "symbol", symbol, "bars", len(bars))
 		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "insufficient_bars"})
-		return
+		return false
 	}
 	signalDecision := decisionlog.Decision{
 		Symbol: symbol, Price: sig.Price, EMAFast: sig.EMAFast, EMASlow: sig.EMASlow,
@@ -220,7 +228,7 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		slog.Debug("no entry signal", "symbol", symbol, "uptrend", sig.Uptrend, "momentum", sig.Momentum, "rsi", sig.RSI)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "no_signal"
 		e.decisionLog.Log(signalDecision)
-		return
+		return false
 	}
 
 	price, err := e.broker.GetLatestPrice(symbol)
@@ -228,7 +236,7 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		slog.Error("get latest price failed", "symbol", symbol, "err", err)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "price_fetch_error: "+err.Error()
 		e.decisionLog.Log(signalDecision)
-		return
+		return false
 	}
 
 	qty := e.risk.PositionSize(acc.Equity, acc.BuyingPower, price, sig.StopPrice)
@@ -236,7 +244,7 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		slog.Info("position size computed to zero, skipping", "symbol", symbol, "price", price, "stop", sig.StopPrice)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "zero_position_size"
 		e.decisionLog.Log(signalDecision)
-		return
+		return false
 	}
 
 	slog.Info("entering position", "symbol", symbol, "qty", qty, "price", price,
@@ -247,12 +255,13 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		slog.Error("place order failed", "symbol", symbol, "err", err)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "order_place_error: "+err.Error()
 		e.decisionLog.Log(signalDecision)
-		return
+		return false
 	}
 	slog.Info("order submitted", "symbol", symbol, "order_id", order.ID)
 	signalDecision.Action, signalDecision.Reason = decisionlog.Enter, "signal"
 	signalDecision.Qty, signalDecision.Stop, signalDecision.Take, signalDecision.OrderID = float64(qty), sig.StopPrice, sig.TakePrice, order.ID
 	e.decisionLog.Log(signalDecision)
+	return true
 }
 
 // ensurePositionsProtected scans every currently held position — regardless
