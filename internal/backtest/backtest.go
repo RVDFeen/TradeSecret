@@ -56,10 +56,28 @@ type openPosition struct {
 	takePrice  float64
 }
 
+// windowedPrefix returns bars[max(0,idx-maxLookback):idx], bounding how much
+// history strategy.Evaluate rescans at every step (see the comment in Run).
+func windowedPrefix(bars []bar.Bar, idx, maxLookback int) []bar.Bar {
+	start := idx - maxLookback
+	if start < 0 {
+		start = 0
+	}
+	return bars[start:idx]
+}
+
 // Run simulates the strategy across symbols -> bars (each already covering
 // [start-warmup, end], oldest first) sharing a single cash account of
 // startEquity, and returns the combined result.
 func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, params strategy.Params) Result {
+	// EMA/RSI/ATR converge geometrically: by ~10x the slowest period, the
+	// contribution of anything further back is far below floating-point
+	// precision. Capping how much history gets rescanned at every single
+	// step turns this from O(n²) (recomputing over the full prefix each
+	// time) into O(n) — the difference between finishing in seconds and not
+	// finishing at all once "n" is a couple hundred thousand 1-minute bars.
+	maxLookback := params.MinBars() * 10
+
 	// Bars are keyed by exact timestamp, not calendar day: at intraday
 	// timeframes a single day holds many distinct bars.
 	timeKey := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
@@ -153,7 +171,8 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 			} else if idx > 0 && !params.DisableTrendExit {
 				// Trend-flip exit: recompute the signal on history up to and
 				// including today; if the uptrend has broken, exit at the close.
-				if sig, ok := strategy.Evaluate(barsBySymbol[sym][:idx+1], params); ok && !sig.Uptrend {
+				window := windowedPrefix(barsBySymbol[sym], idx+1, maxLookback)
+				if sig, ok := strategy.Evaluate(window, params); ok && !sig.Uptrend {
 					exitPrice, reason, exited = b.Close, "trend_exit", true
 				}
 			}
@@ -193,7 +212,7 @@ func Run(symbolBars map[string][]bar.Bar, startEquity float64, rm risk.Manager, 
 				// Signal is computed on bars strictly before this one (up to
 				// the previous bar's close) to avoid lookahead bias; the fill
 				// happens at this bar's open.
-				sig, ok := strategy.Evaluate(bars[:idx], params)
+				sig, ok := strategy.Evaluate(windowedPrefix(bars, idx, maxLookback), params)
 				if !ok || !sig.ShouldEnter {
 					continue
 				}

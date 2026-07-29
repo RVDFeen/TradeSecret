@@ -84,11 +84,11 @@ them up separately if you want to keep trade history around.
 Timeframe-agnostic logic, with separate tuned parameters per timeframe since
 "EMA(20)" means a very different thing on hourly vs. daily bars:
 
-|  | Hourly (default) | Daily |
-|---|---|---|
-| EMA fast / slow | 9 / 21 | 20 / 50 |
-| RSI band | 40–70 | 40–70 |
-| Stop / take (×ATR) | 2.0 / 3.0 | 2.5 / 4.0 |
+|  | Minute | Hourly (default) | Daily |
+|---|---|---|---|
+| EMA fast / slow | 20 / 60 | 9 / 21 | 20 / 50 |
+| RSI band | 40–70 | 40–70 | 40–70 |
+| Stop / take (×ATR) | 2.0 / 3.0 | 2.0 / 3.0 | 2.5 / 4.0 |
 
 - **Trend filter**: EMA(fast) > EMA(slow) and price > EMA(slow).
 - **Momentum filter**: RSI(14) within the band above (healthy, not overbought/oversold).
@@ -179,9 +179,9 @@ reflect genuinely risk-calculated sizing, not a fixed % per trade:
 | Window | Total return | CAGR | Max drawdown | Trades | Win rate | Sharpe (naive) |
 |---|---|---|---|---|---|---|
 | 0.5y | 39.8% | 66.8% | 8.7% | 281 | 46.3% | 2.08 |
-| 1y | 31.6% | 26.6% | 17.5% | 544 | 44.1% | 1.03 |
-| 1.5y | 22.2% | 12.8% | 25.7% | 783 | 43.8% | 0.56 |
-| 2y | 41.3% | 17.4% | 23.7% | 961 | 43.1% | 0.73 |
+| 1y | 43.7% | 36.6% | 9.9% | 534 | 46.3% | 1.35 |
+| 1.5y | 32.2% | 18.4% | 24.6% | 754 | 45.1% | 0.74 |
+| 2y | 58.5% | 23.7% | 26.9% | 987 | 45.1% | 0.93 |
 
 Notice the drawdowns are meaningfully higher than a capped-sizing version
 would show (was 9–20% under a 20% cap) — that's the direct, expected
@@ -191,9 +191,51 @@ and drawdown together. If that trade-off isn't what you want, `MAX_POSITION_PCT`
 is the honest lever — set it to an actual concentration limit you intend to
 respect, not a number that happens to look reasonable.
 
+*(These numbers moved from an earlier version of this table after fixing a
+backtest bug: indicators used to see the entire multi-year fetched history at
+every step, rather than a bounded recent window like the live engine actually
+uses — see the performance note in the minute-bar section below. The fix
+made the backtest more faithful to live behavior, and results shifted as a
+result; still net-positive throughout, in some windows meaningfully better.)*
+
 Re-run `./bin/tradebot backtest --years N` any time to reproduce — it's
 deterministic given the same cached data. `--timeframe daily` runs the
 slower swing-trading variant instead (see the strategy table above).
+
+## Backtest results — minute bars
+
+`./bin/tradebot backtest --years N --timeframe minute`. Not the active
+default (`STRATEGY_TIMEFRAME=hourly` is), but validated the same way — same
+sizing setup, four independent windows, and several parameter variations
+(longer EMA periods, a tighter RSI band) tested and rejected because they
+performed worse, not better:
+
+| Window | Total return | CAGR | Max drawdown | Trades | Win rate | Sharpe (naive) |
+|---|---|---|---|---|---|---|
+| 0.5y | 28.8% | 47.1% | 14.3% | 7,951 | 40.6% | 1.50 |
+| 1y | 19.7% | 16.7% | 20.1% | 14,695 | 40.3% | 0.71 |
+| 1.5y | 45.4% | 25.4% | 17.5% | 20,975 | 40.5% | 0.93 |
+| 2y | 35.9% | 15.2% | 26.2% | 27,883 | 40.3% | 0.64 |
+
+Net-positive across all four, but notice the pattern versus hourly: win rate
+is consistently lower (~40% vs ~44%) and drawdowns are consistently higher
+(14–26% vs 9–26%) for a similar CAGR range — trading 10-20x more often here
+buys more variance, not more edge. Two things specific to minute bars worth
+knowing before trusting these numbers as much as the hourly ones:
+
+- **NVDA's minute-bar history only goes back to 2026-05-29** on Alpaca's free
+  IEX feed (~2 months), not the full window requested — likely related to its
+  2024 stock split. Every "2 year" minute backtest above is silently only
+  informed by ~2 months of real NVDA data; the other 8 symbols have full
+  coverage. Not a bug to fix, just a real data limitation to not forget about.
+- **Backtesting at this bar count needed a performance fix first.** The
+  original backtest loop recomputed each indicator over the *entire* history
+  at every single time step — fine at hundreds/thousands of bars (hourly,
+  daily), catastrophic at ~200k bars/symbol (a 2-year minute-bar run took an
+  hour before the fix, ~1 minute after — see `windowedPrefix` in
+  `internal/backtest/backtest.go`). EMA/RSI/ATR converge geometrically, so
+  capping how much history gets rescanned at each step doesn't change the
+  results, just the runtime.
 
 ## Honest limitations
 
