@@ -98,6 +98,19 @@ type Signal struct {
 	TakePrice   float64 // suggested take-profit if entering now
 }
 
+// TrendStrength is how far EMA fast has separated from EMA slow, as a
+// fraction of price — a proxy for how confirmed the trend is, used to rank
+// multiple simultaneously-qualifying candidates against each other. Not a
+// validated "better trades" signal on its own, just a tie-breaker: among
+// names that already both passed the trend and momentum filters, prefer the
+// one with more separation.
+func (s Signal) TrendStrength() float64 {
+	if s.EMASlow == 0 {
+		return 0
+	}
+	return (s.EMAFast - s.EMASlow) / s.EMASlow
+}
+
 // MinBars returns how many bars are needed before Evaluate can produce a result.
 func (p Params) MinBars() int {
 	m := p.EMASlowPeriod

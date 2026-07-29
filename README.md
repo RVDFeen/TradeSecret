@@ -102,6 +102,40 @@ Long-only by design: shorting isn't wired up. Easy to add later, but it
 roughly doubles the ways this can go wrong before you've validated the long
 side works.
 
+## Which symbols it trades
+
+Two modes, `UNIVERSE_MODE` in `.env`:
+
+- **`static` (default)** — trades exactly the symbols in `WATCHLIST`.
+- **`dynamic`** — ignores `WATCHLIST` for the live engine. Once per calendar
+  day, ranks (almost) every tradable, active US common stock on a major
+  exchange (~12,000 symbols) by average dollar volume (price × volume) and
+  trades the top `UNIVERSE_SIZE` (default 50) of them for the rest of that
+  day. Rationale and mechanics:
+  - **Why once a day, not every poll**: Alpaca's free tier caps at 200 API
+    calls/minute. Scanning ~12,000 symbols needs batch requests
+    (`GetMultiBars`) and takes ~1-2 minutes — fine once a day, not fine every
+    30 seconds. The daily shortlist is what actually gets polled frequently.
+  - **Why liquidity, not a fixed index list**: ranking dynamically by dollar
+    volume means the universe reflects whatever's actually being heavily
+    traded *today* (semiconductor names one day, something else the next),
+    rather than a static membership list that goes stale between rebalances.
+  - **Ranking candidates when multiple qualify at once**: with 50 symbols
+    instead of 9, having several pass the entry filter in the same tick is
+    common. They're ranked by `Signal.TrendStrength()` (how far EMA fast has
+    separated from EMA slow, as a fraction of price) and the strongest ones
+    fill the available `MAX_POSITIONS` slots first — first-come-first-served
+    by list order stopped being a meaningful way to pick "the best" once the
+    list got long.
+  - **Not backtestable yet.** `backtest` still only runs against the static
+    `WATCHLIST` — simulating the daily re-ranking historically would need
+    bar data for the entire past universe on every past day, which is a
+    meaningfully bigger data and engineering problem than anything else in
+    this repo so far. Treat dynamic-universe mode as validated at the
+    strategy level (same entry/exit/risk logic, already backtested) but
+    *not* validated at the symbol-selection level — there's no historical
+    evidence the liquidity ranking itself adds or subtracts edge.
+
 ## Setup
 
 ```
@@ -282,4 +316,5 @@ internal/cache/        on-disk cache for historical bars (data/cache/)
 internal/tradelog/     persistent fill ledger (data/trades.jsonl)
 internal/decisionlog/  persistent record of every decision, traded or not (data/decisions.jsonl)
 internal/timeframe/    bar-resolution type shared by strategy/backtest/cache
+internal/universe/     daily liquidity ranking + cache for dynamic-universe mode (data/universe.json)
 ```

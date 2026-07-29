@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"tradebot/internal/bar"
@@ -18,6 +19,7 @@ import (
 	"tradebot/internal/strategy"
 	"tradebot/internal/timeframe"
 	"tradebot/internal/tradelog"
+	"tradebot/internal/universe"
 )
 
 const (
@@ -33,6 +35,9 @@ type Engine struct {
 	lookbackDays int // calendar days of history to fetch per evaluation
 	tradeLog     *tradelog.Logger
 	decisionLog  *decisionlog.Logger
+
+	currentUniverse []string // symbols actually scanned this run (static watchlist, or today's dynamic shortlist)
+	universeDate    string   // calendar date currentUniverse was computed for, when dynamic
 
 	dayStartEquity float64
 	dayStartDate   string
@@ -78,7 +83,11 @@ func New(cfg *config.Config, b *broker.Broker) (*Engine, error) {
 // Run blocks, polling at cfg.PollInterval while the market is open, until ctx
 // is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
-	slog.Info("engine starting", "watchlist", e.cfg.Watchlist, "poll_interval", e.cfg.PollInterval)
+	if e.cfg.DynamicUniverse {
+		slog.Info("engine starting", "universe_mode", "dynamic", "universe_size", e.cfg.UniverseSize, "poll_interval", e.cfg.PollInterval)
+	} else {
+		slog.Info("engine starting", "watchlist", e.cfg.Watchlist, "poll_interval", e.cfg.PollInterval)
+	}
 
 	for {
 		select {
@@ -163,9 +172,11 @@ func (e *Engine) tick(ctx context.Context) {
 		return
 	}
 
+	symbols := e.symbolsToScan()
+
 	if e.haltedToday {
 		slog.Info("halted for the day, skipping new entries", "open_positions", len(positions))
-		for _, symbol := range e.cfg.Watchlist {
+		for _, symbol := range symbols {
 			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "halted_daily_loss"})
 		}
 		return
@@ -173,13 +184,21 @@ func (e *Engine) tick(ctx context.Context) {
 
 	if !e.risk.CanOpenNewPosition(len(positions)) {
 		slog.Info("max concurrent positions reached, skipping new entries", "open_positions", len(positions))
-		for _, symbol := range e.cfg.Watchlist {
+		for _, symbol := range symbols {
 			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "max_positions_reached"})
 		}
 		return
 	}
 
-	for _, symbol := range e.cfg.Watchlist {
+	// Pass 1: evaluate every candidate not already held/pending, and collect
+	// the ones whose signal says to enter. Nothing gets bought yet — this is
+	// just gathering the field before ranking it.
+	type candidate struct {
+		symbol string
+		sig    strategy.Signal
+	}
+	var candidates []candidate
+	for _, symbol := range symbols {
 		select {
 		case <-ctx.Done():
 			return
@@ -190,45 +209,130 @@ func (e *Engine) tick(ctx context.Context) {
 			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "already_held_or_pending"})
 			continue
 		}
-		if !e.risk.CanOpenNewPosition(len(positions)) {
-			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "max_positions_reached_mid_tick"})
-			break // filled up mid-loop
+		sig, ok := e.evaluateSignal(symbol)
+		if !ok {
+			continue // evaluateSignal already logged why
 		}
+		if !sig.ShouldEnter {
+			slog.Debug("no entry signal", "symbol", symbol, "uptrend", sig.Uptrend, "momentum", sig.Momentum, "rsi", sig.RSI)
+			e.decisionLog.Log(decisionlog.Decision{
+				Symbol: symbol, Action: decisionlog.Skip, Reason: "no_signal",
+				Price: sig.Price, EMAFast: sig.EMAFast, EMASlow: sig.EMASlow, RSI: sig.RSI, ATR: sig.ATR,
+				Uptrend: decisionlog.Bool(sig.Uptrend), Momentum: decisionlog.Bool(sig.Momentum),
+			})
+			continue
+		}
+		candidates = append(candidates, candidate{symbol: symbol, sig: sig})
+	}
 
-		if e.evaluateAndMaybeEnter(symbol, acc) {
+	// Pass 2: rank qualifying candidates by trend strength and take the
+	// strongest ones first, up to whatever slots MAX_POSITIONS still allows.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].sig.TrendStrength() > candidates[j].sig.TrendStrength()
+	})
+
+	for i, c := range candidates {
+		if !e.risk.CanOpenNewPosition(len(positions)) {
+			// Every remaining candidate loses out to higher-ranked ones (or
+			// ones already held) hitting the cap first — log them as a group
+			// rather than silently dropping them from the record.
+			for _, rest := range candidates[i:] {
+				e.decisionLog.Log(decisionlog.Decision{
+					Symbol: rest.symbol, Action: decisionlog.Skip, Reason: "ranked_lower_max_positions",
+					Price: rest.sig.Price, EMAFast: rest.sig.EMAFast, EMASlow: rest.sig.EMASlow,
+					RSI: rest.sig.RSI, ATR: rest.sig.ATR,
+				})
+			}
+			break
+		}
+		if e.enterPosition(c.symbol, c.sig, acc) {
 			// Mark it held immediately: len(positions) is what the guard
 			// above checks, and it must reflect entries placed earlier in
-			// this very loop, not just what existed when the tick started —
-			// otherwise the position cap only works across ticks, not within
-			// one, and a single tick can open far more than MAX_POSITIONS.
-			positions[symbol] = true
+			// this very pass — otherwise the position cap only works across
+			// ticks, not within one, and a single tick can open far more
+			// than MAX_POSITIONS.
+			positions[c.symbol] = true
 		}
 	}
 }
 
-// evaluateAndMaybeEnter returns true if it placed an entry order.
-func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot) bool {
+// symbolsToScan returns the static watchlist, or — in dynamic-universe mode
+// — today's liquidity-ranked shortlist, refreshing it once per calendar day.
+func (e *Engine) symbolsToScan() []string {
+	if !e.cfg.DynamicUniverse {
+		return e.cfg.Watchlist
+	}
+
+	today := universe.Today()
+	if e.universeDate == today && len(e.currentUniverse) > 0 {
+		return e.currentUniverse
+	}
+
+	if cached, ok := universe.Load(); ok {
+		slog.Info("loaded today's universe from cache", "size", len(cached.Symbols))
+		e.currentUniverse, e.universeDate = cached.Symbols, today
+		return e.currentUniverse
+	}
+
+	slog.Info("refreshing daily universe — ranking tradable symbols by liquidity", "target_size", e.cfg.UniverseSize)
+	symbols, err := e.refreshUniverse()
+	if err != nil {
+		slog.Error("universe refresh failed — falling back to previous/static list", "err", err)
+		if len(e.currentUniverse) > 0 {
+			return e.currentUniverse
+		}
+		return e.cfg.Watchlist
+	}
+	slog.Info("universe refreshed", "size", len(symbols))
+	e.currentUniverse, e.universeDate = symbols, today
+	return e.currentUniverse
+}
+
+// universeLiquidityLookbackDays is how much daily-bar history feeds the
+// liquidity ranking — a couple weeks smooths out single-day noise without
+// needing much data.
+const universeLiquidityLookbackDays = 15
+
+func (e *Engine) refreshUniverse() ([]string, error) {
+	tradable, err := e.broker.GetTradableSymbols()
+	if err != nil {
+		return nil, err
+	}
+	barsBySymbol, err := e.broker.GetMultiRecentDailyBars(tradable, universeLiquidityLookbackDays)
+	if err != nil {
+		return nil, err
+	}
+	top := universe.RankByLiquidity(barsBySymbol, e.cfg.UniverseSize)
+	if err := universe.Save(top); err != nil {
+		slog.Error("failed to persist universe cache", "err", err) // non-fatal, just means recompute next restart
+	}
+	return top, nil
+}
+
+// evaluateSignal fetches bars and computes the strategy signal for symbol,
+// logging (and returning false for) the cases where it can't produce one.
+func (e *Engine) evaluateSignal(symbol string) (strategy.Signal, bool) {
 	bars, err := e.broker.GetRecentBars(symbol, e.cfg.Timeframe, e.lookbackDays)
 	if err != nil {
 		slog.Error("get bars failed", "symbol", symbol, "err", err)
 		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "bars_fetch_error: " + err.Error()})
-		return false
+		return strategy.Signal{}, false
 	}
 	sig, ok := strategy.Evaluate(bars, e.params)
 	if !ok {
 		slog.Warn("not enough bar history to evaluate", "symbol", symbol, "bars", len(bars))
 		e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "insufficient_bars"})
-		return false
+		return strategy.Signal{}, false
 	}
+	return sig, true
+}
+
+// enterPosition sizes and places an entry order for a symbol whose signal
+// already said to enter, returning true if an order was actually submitted.
+func (e *Engine) enterPosition(symbol string, sig strategy.Signal, acc broker.AccountSnapshot) bool {
 	signalDecision := decisionlog.Decision{
 		Symbol: symbol, Price: sig.Price, EMAFast: sig.EMAFast, EMASlow: sig.EMASlow,
 		RSI: sig.RSI, ATR: sig.ATR, Uptrend: decisionlog.Bool(sig.Uptrend), Momentum: decisionlog.Bool(sig.Momentum),
-	}
-	if !sig.ShouldEnter {
-		slog.Debug("no entry signal", "symbol", symbol, "uptrend", sig.Uptrend, "momentum", sig.Momentum, "rsi", sig.RSI)
-		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "no_signal"
-		e.decisionLog.Log(signalDecision)
-		return false
 	}
 
 	price, err := e.broker.GetLatestPrice(symbol)
@@ -239,18 +343,29 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 		return false
 	}
 
-	qty := e.risk.PositionSize(acc.Equity, acc.BuyingPower, price, sig.StopPrice)
+	// Re-anchor stop/take to the live price just fetched, not sig.Price (from
+	// the bar the signal was computed on) — preserve the ATR-based distance,
+	// but the absolute levels must be relative to what we're actually about
+	// to pay. Otherwise, on a fast-moving bar, price can already have run
+	// past the stale take-profit level by the time the order reaches Alpaca,
+	// which rejects it ("take_profit.limit_price must be >= base_price").
+	stopDistance := sig.Price - sig.StopPrice
+	takeDistance := sig.TakePrice - sig.Price
+	stopPrice := price - stopDistance
+	takePrice := price + takeDistance
+
+	qty := e.risk.PositionSize(acc.Equity, acc.BuyingPower, price, stopPrice)
 	if qty <= 0 {
-		slog.Info("position size computed to zero, skipping", "symbol", symbol, "price", price, "stop", sig.StopPrice)
+		slog.Info("position size computed to zero, skipping", "symbol", symbol, "price", price, "stop", stopPrice)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "zero_position_size"
 		e.decisionLog.Log(signalDecision)
 		return false
 	}
 
 	slog.Info("entering position", "symbol", symbol, "qty", qty, "price", price,
-		"stop", sig.StopPrice, "take", sig.TakePrice, "rsi", sig.RSI, "atr", sig.ATR)
+		"stop", stopPrice, "take", takePrice, "rsi", sig.RSI, "atr", sig.ATR)
 
-	order, err := e.broker.PlaceBracketBuy(symbol, qty, sig.StopPrice, sig.TakePrice)
+	order, err := e.broker.PlaceBracketBuy(symbol, qty, stopPrice, takePrice)
 	if err != nil {
 		slog.Error("place order failed", "symbol", symbol, "err", err)
 		signalDecision.Action, signalDecision.Reason = decisionlog.Skip, "order_place_error: "+err.Error()
@@ -259,7 +374,7 @@ func (e *Engine) evaluateAndMaybeEnter(symbol string, acc broker.AccountSnapshot
 	}
 	slog.Info("order submitted", "symbol", symbol, "order_id", order.ID)
 	signalDecision.Action, signalDecision.Reason = decisionlog.Enter, "signal"
-	signalDecision.Qty, signalDecision.Stop, signalDecision.Take, signalDecision.OrderID = float64(qty), sig.StopPrice, sig.TakePrice, order.ID
+	signalDecision.Qty, signalDecision.Stop, signalDecision.Take, signalDecision.OrderID = float64(qty), stopPrice, takePrice, order.ID
 	e.decisionLog.Log(signalDecision)
 	return true
 }

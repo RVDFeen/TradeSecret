@@ -34,6 +34,88 @@ func New(cfg *config.Config) *Broker {
 	return &Broker{trading: trading, data: data}
 }
 
+// majorExchanges excludes OTC and similar thin/unreliable venues.
+var majorExchanges = map[string]bool{
+	"NYSE": true, "NASDAQ": true, "ARCA": true, "BATS": true, "AMEX": true,
+}
+
+// isPlainTicker filters out warrants, preferred shares, test symbols, and
+// other non-standard tickers that tend to be illiquid or behave oddly for a
+// trend-following strategy — plain common-stock tickers only.
+func isPlainTicker(s string) bool {
+	if len(s) == 0 || len(s) > 5 {
+		return false
+	}
+	for _, r := range s {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// GetTradableSymbols returns every tradable, active US equity common-stock
+// symbol on a major exchange — the broad universe the daily liquidity
+// ranking picks its shortlist from.
+func (b *Broker) GetTradableSymbols() ([]string, error) {
+	assets, err := b.trading.GetAssets(alpaca.GetAssetsRequest{
+		Status:     "active",
+		AssetClass: "us_equity",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get assets: %w", err)
+	}
+	out := make([]string, 0, len(assets))
+	for _, a := range assets {
+		if !a.Tradable || !majorExchanges[a.Exchange] || !isPlainTicker(a.Symbol) {
+			continue
+		}
+		out = append(out, a.Symbol)
+	}
+	return out, nil
+}
+
+// multiBarsChunkSize bounds how many symbols go into a single GetMultiBars
+// call, so one oversized request doesn't risk hitting a server-side limit.
+const multiBarsChunkSize = 200
+
+// GetMultiRecentDailyBars fetches the last lookbackDays of daily bars for
+// many symbols at once (chunked), for the daily liquidity ranking. This is
+// what makes ranking thousands of symbols feasible within rate limits: a
+// batch call instead of one request per symbol.
+func (b *Broker) GetMultiRecentDailyBars(symbols []string, lookbackDays int) (map[string][]bar.Bar, error) {
+	end := time.Now()
+	start := end.AddDate(0, 0, -lookbackDays)
+
+	out := make(map[string][]bar.Bar, len(symbols))
+	for i := 0; i < len(symbols); i += multiBarsChunkSize {
+		j := i + multiBarsChunkSize
+		if j > len(symbols) {
+			j = len(symbols)
+		}
+		raw, err := b.data.GetMultiBars(symbols[i:j], marketdata.GetBarsRequest{
+			TimeFrame:  marketdata.OneDay,
+			Start:      start,
+			End:        end,
+			Feed:       marketdata.IEX,
+			Adjustment: marketdata.Raw,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get multi bars (symbols %d-%d): %w", i, j, err)
+		}
+		for sym, bars := range raw {
+			converted := make([]bar.Bar, len(bars))
+			for k, x := range bars {
+				converted[k] = bar.Bar{
+					Time: x.Timestamp, Open: x.Open, High: x.High, Low: x.Low, Close: x.Close, Volume: float64(x.Volume),
+				}
+			}
+			out[sym] = converted
+		}
+	}
+	return out, nil
+}
+
 func (b *Broker) GetClock() (*alpaca.Clock, error) {
 	return b.trading.GetClock()
 }

@@ -20,6 +20,14 @@ type Config struct {
 	PollInterval time.Duration
 	Timeframe    timeframe.Timeframe // bar resolution the strategy trades on
 
+	// DynamicUniverse, when true, ignores Watchlist for the live engine and
+	// instead trades whichever UniverseSize symbols ranked most liquid in
+	// today's daily scan across (almost) every tradable US equity. Watchlist
+	// remains what `backtest` uses either way — the dynamic universe is a
+	// live-only feature (see README for why).
+	DynamicUniverse bool
+	UniverseSize    int
+
 	RiskPerTradePct   float64 // % of equity risked per trade (via stop distance)
 	MaxPositionPct    float64 // max % of equity in a single position
 	MaxPositions      int     // max number of concurrent open positions
@@ -144,6 +152,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid POLL_INTERVAL %q: %w", pollRaw, err)
 	}
 	cfg.PollInterval = d
+
+	cfg.DynamicUniverse = strings.EqualFold(strings.TrimSpace(os.Getenv("UNIVERSE_MODE")), "dynamic")
+	cfg.UniverseSize = getInt("UNIVERSE_SIZE", 50)
 
 	cfg.RiskPerTradePct = getFloat("RISK_PER_TRADE_PCT", 1.0)
 	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 100.0)
