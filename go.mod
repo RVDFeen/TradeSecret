@@ -1,6 +1,6 @@
 module tradebot
 
-go 1.26.5
+go 1.24
 
 require (
 	cloud.google.com/go v0.118.0 // indirect
