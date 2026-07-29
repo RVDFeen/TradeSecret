@@ -1,0 +1,16 @@
+services:
+  tradebot:
+    build: .
+    image: tradebot:latest
+    env_file:
+      - .env
+    volumes:
+      - tradebot-cache:/app/.cache
+    restart: unless-stopped
+    # Default: the live paper-trading loop. Override for one-off runs, e.g.:
+    #   docker compose run --rm tradebot backtest --years 2 --timeframe hourly
+    #   docker compose run --rm tradebot run --once
+    command: ["run"]
+
+volumes:
+  tradebot-cache:

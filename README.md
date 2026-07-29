@@ -90,6 +90,23 @@ me — **rotate that key if it's ever been shared anywhere else**, since it's
 sitting in plaintext on disk). `.env` is gitignored; `.env.example` shows the
 shape without secrets.
 
+### Running with Docker instead
+
+```
+docker compose up -d --build       # starts the live loop (`run`), builds on first use
+docker compose logs -f             # follow its output
+docker compose down                # stop it
+
+# One-off commands instead of the live loop:
+docker compose run --rm tradebot backtest --years 2 --timeframe hourly
+docker compose run --rm tradebot run --once
+```
+
+`.env` is read via `env_file` in `docker-compose.yml` — it's never baked into
+the image (`.dockerignore` excludes it from the build context too). The bar
+cache persists across restarts in a named volume (`tradebot-cache`), so you
+don't lose it every time the container restarts.
+
 ## Usage
 
 ```
