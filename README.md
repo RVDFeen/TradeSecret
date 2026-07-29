@@ -125,18 +125,28 @@ docker compose run --rm tradebot backtest --years 2 --timeframe hourly
 docker compose run --rm tradebot run --once
 ```
 
-`.env` is read via `env_file` in `docker-compose.yml` — it's never baked into
+`.env` is read via `env_file` in `compose.yaml` — it's never baked into
 the image (`.dockerignore` excludes it from the build context too). The bar
-cache persists across restarts in a named volume (`tradebot-cache`), so you
-don't lose it every time the container restarts.
+cache and trade/decision logs persist across restarts in a named volume
+(`tradebot-data`, mounted at `/app/data`), so you don't lose them every time
+the container restarts.
 
 The compose file builds straight from
 [github.com/RVDFeen/TradeSecret](https://github.com/RVDFeen/TradeSecret)
 (`main` branch, at build time) rather than the local directory — so deploying
-somewhere else is just copying `docker-compose.yml` and `.env`, nothing else.
+somewhere else is just copying `compose.yaml` and `.env`, nothing else.
 If you're actively editing the code locally, change `build:` to `.` in
-`docker-compose.yml` so your uncommitted changes get built instead of what's
+`compose.yaml` so your uncommitted changes get built instead of what's
 on GitHub.
+
+**Note on `image:`**: the service deliberately has no `image:` key — only
+`build:`. If both are set and you (or a deploy tool) run `docker compose
+pull`, Compose tries to pull the `image:` name from a registry, which fails
+since this image is never published anywhere ("repository does not exist").
+Without `image:`, `pull` correctly skips this service and `docker compose
+build` / `up --build` builds it locally instead. If your deploy tool runs a
+separate `pull` step before `up`, make sure it's configured to build rather
+than pull for this stack (e.g. Komodo's stack settings).
 
 ## Usage
 

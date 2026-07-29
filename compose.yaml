@@ -4,8 +4,13 @@ services:
     # plus .env. Pulls whatever is on `main` at build time. If you're actively
     # editing the code locally, swap this line for `build: .` so your
     # uncommitted changes get picked up instead of what's pushed.
+    #
+    # Deliberately no `image:` here: this is never published to a registry,
+    # so if both `build` and `image` are set, `docker compose pull` tries to
+    # pull that image from Docker Hub and fails ("repository does not
+    # exist"). Without `image:`, pull correctly skips this service and
+    # `docker compose build` / `up --build` builds it locally instead.
     build: https://github.com/RVDFeen/TradeSecret.git
-    image: tradebot:latest
     env_file:
       - .env
     volumes:

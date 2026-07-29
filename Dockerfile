@@ -19,7 +19,7 @@ WORKDIR /app
 COPY --from=build /out/tradebot /app/tradebot
 
 # Bar cache and the trade log both live here; mount a volume at this path to
-# persist them across container restarts (see docker-compose.yml).
+# persist them across container restarts (see compose.yaml).
 RUN mkdir -p /app/data && chown -R tradebot:tradebot /app
 USER tradebot
 
