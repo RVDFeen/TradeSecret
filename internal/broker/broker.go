@@ -350,6 +350,34 @@ func (b *Broker) PlaceProtectiveOCO(symbol string, qty, stopPrice, takePrice flo
 	})
 }
 
+// CancelOrdersForSymbol cancels every still-active order for symbol (any
+// order whose lifecycle isn't already terminal), without touching orders for
+// any other symbol the way CancelAllOrders would. Needed before closing a
+// position out from under its own bracket: the stop/take-profit legs hold a
+// claim on the shares, and Alpaca rejects a separate sell for "insufficient
+// qty available" until those legs are cancelled first.
+func (b *Broker) CancelOrdersForSymbol(symbol string) error {
+	orders, err := b.trading.GetOrders(alpaca.GetOrdersRequest{
+		Status:    "all",
+		Symbols:   []string{symbol},
+		Limit:     50,
+		Direction: "desc",
+	})
+	if err != nil {
+		return fmt.Errorf("get orders for %s: %w", symbol, err)
+	}
+	for _, o := range orders {
+		resolved := o.FilledAt != nil || o.ExpiredAt != nil || o.CanceledAt != nil || o.FailedAt != nil
+		if resolved {
+			continue
+		}
+		if err := b.trading.CancelOrder(o.ID); err != nil {
+			return fmt.Errorf("cancel order %s for %s: %w", o.ID, symbol, err)
+		}
+	}
+	return nil
+}
+
 // ClosePosition liquidates the full position in symbol at market.
 func (b *Broker) ClosePosition(symbol string) error {
 	_, err := b.trading.ClosePosition(symbol, alpaca.ClosePositionRequest{})

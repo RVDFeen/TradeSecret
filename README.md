@@ -97,6 +97,24 @@ Timeframe-agnostic logic, with separate tuned parameters per timeframe since
 - **Exit**: whichever bracket leg fills first. (An earlier "trend flip" exit
   was tested and backtested *worse* — it clips winners before they reach the
   target — so it's disabled by default; see `--no-trend-exit` below.)
+- **Early exit / rotation** (`ENABLE_ROTATION=true`, off by default): normally
+  the only exit is the bracket above. With rotation on, if every
+  `MAX_POSITIONS` slot is full (or the top candidate simply can't be sized —
+  most commonly not enough buying power, which happens well before the slot
+  count runs out once a few positions have absorbed most of the account) and
+  the best candidate this tick is clearly stronger (`Signal.TrendStrength()`,
+  by more than `ROTATION_MARGIN`) than the *weakest* currently-held position,
+  the weak one gets closed to make room — canceling its own bracket order
+  first, since those legs otherwise hold a claim on the shares and block a
+  plain close. It doesn't try to enter the new candidate in the same tick;
+  the next tick's normal scan picks it up once the close has settled.
+  Verified end-to-end against the paper account (closed a flat/reversing
+  position, freed capital, next tick entered the stronger candidate) but,
+  like dynamic-universe mode, this is a genuinely different kind of exit than
+  what's backtested — the bracket-only exit is what the numbers above
+  reflect, this adds real turnover on top of that with no historical
+  validation of its own. Start with a meaningful `ROTATION_MARGIN` (default
+  0.01) so it doesn't swap positions on noise.
 
 Long-only by design: shorting isn't wired up. Easy to add later, but it
 roughly doubles the ways this can go wrong before you've validated the long

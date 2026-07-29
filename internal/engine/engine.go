@@ -189,7 +189,12 @@ func (e *Engine) tick(ctx context.Context) {
 		return
 	}
 
-	if !e.risk.CanOpenNewPosition(len(positions)) {
+	if !e.risk.CanOpenNewPosition(len(positions)) && !e.cfg.EnableRotation {
+		// With rotation disabled, there's nothing a full slate of positions
+		// could lead to, so skip scanning entirely rather than spend the
+		// rate-limit budget on candidates that can't be acted on regardless.
+		// With rotation enabled, keep going: a strong-enough candidate might
+		// still justify closing a weaker holding for it.
 		slog.Info("max concurrent positions reached, skipping new entries", "open_positions", len(positions))
 		for _, symbol := range symbols {
 			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "max_positions_reached"})
@@ -266,6 +271,19 @@ func (e *Engine) tick(ctx context.Context) {
 		return candidates[i].sig.TrendStrength() > candidates[j].sig.TrendStrength()
 	})
 
+	// bestUnfilled is the highest-ranked candidate that qualified but didn't
+	// end up entered this tick — whether because every slot was full, or
+	// because it made it to enterPosition but couldn't actually be sized or
+	// filled (most commonly: not enough buying power, which happens well
+	// before MAX_POSITIONS is reached once a few positions have absorbed
+	// most of the account). Feeds the rotation check below.
+	var bestUnfilled *candidate
+	noteUnfilled := func(c candidate) {
+		if bestUnfilled == nil {
+			bestUnfilled = &c
+		}
+	}
+
 	for i, c := range candidates {
 		if !e.risk.CanOpenNewPosition(len(positions)) {
 			// Every remaining candidate loses out to higher-ranked ones (or
@@ -278,6 +296,7 @@ func (e *Engine) tick(ctx context.Context) {
 					RSI: rest.sig.RSI, ATR: rest.sig.ATR,
 				})
 			}
+			noteUnfilled(candidates[i])
 			break
 		}
 		if e.enterPosition(c.symbol, c.sig, acc) {
@@ -287,8 +306,79 @@ func (e *Engine) tick(ctx context.Context) {
 			// ticks, not within one, and a single tick can open far more
 			// than MAX_POSITIONS.
 			positions[c.symbol] = true
+		} else {
+			// enterPosition already logged the specific reason (zero size,
+			// buying power, order error, ...).
+			noteUnfilled(c)
 		}
 	}
+
+	if e.cfg.EnableRotation && bestUnfilled != nil {
+		e.maybeRotate(positions, bestUnfilled.symbol, bestUnfilled.sig)
+	}
+}
+
+// maybeRotate closes the weakest currently-held position if candidateSig is
+// clearly stronger (by more than ROTATION_MARGIN in TrendStrength) than that
+// weakest holding — freeing both a slot and capital for it. Doesn't retry
+// entering candidateSymbol itself this same tick; the next tick's normal
+// scan picks it up once the close has actually settled. Opt-in
+// (ENABLE_ROTATION) and unvalidated by backtest — see README.
+func (e *Engine) maybeRotate(positions map[string]bool, candidateSymbol string, candidateSig strategy.Signal) {
+	held, err := e.broker.GetOpenPositions()
+	if err != nil {
+		slog.Error("get open positions failed for rotation check", "err", err)
+		return
+	}
+
+	type heldSignal struct {
+		symbol string
+		sig    strategy.Signal
+	}
+	var weakest *heldSignal
+	for _, pos := range held {
+		bars, err := e.broker.GetRecentBars(pos.Symbol, e.cfg.Timeframe, e.lookbackDays)
+		if err != nil {
+			slog.Error("get bars failed while evaluating rotation candidate", "symbol", pos.Symbol, "err", err)
+			continue
+		}
+		sig, ok := strategy.Evaluate(bars, e.params)
+		if !ok {
+			continue
+		}
+		if weakest == nil || sig.TrendStrength() < weakest.sig.TrendStrength() {
+			weakest = &heldSignal{symbol: pos.Symbol, sig: sig}
+		}
+	}
+	if weakest == nil {
+		return
+	}
+
+	if candidateSig.TrendStrength() < weakest.sig.TrendStrength()+e.cfg.RotationMargin {
+		slog.Debug("rotation considered, not clearly better", "weakest_held", weakest.symbol,
+			"weakest_strength", weakest.sig.TrendStrength(), "candidate", candidateSymbol, "candidate_strength", candidateSig.TrendStrength())
+		return
+	}
+
+	slog.Info("rotating: closing weaker position for a clearly stronger candidate",
+		"closing", weakest.symbol, "closing_strength", weakest.sig.TrendStrength(),
+		"candidate", candidateSymbol, "candidate_strength", candidateSig.TrendStrength())
+	// The position's own bracket (stop/take) legs hold a claim on its
+	// shares; cancel those first or ClosePosition fails with "insufficient
+	// qty available" even though the position is clearly ours to sell.
+	if err := e.broker.CancelOrdersForSymbol(weakest.symbol); err != nil {
+		slog.Error("failed to cancel existing orders before rotation close", "symbol", weakest.symbol, "err", err)
+		return
+	}
+	if err := e.broker.ClosePosition(weakest.symbol); err != nil {
+		slog.Error("failed to close position for rotation", "symbol", weakest.symbol, "err", err)
+		return
+	}
+	e.decisionLog.Log(decisionlog.Decision{
+		Symbol: weakest.symbol, Action: decisionlog.Skip, Reason: "rotated_out_for_stronger_candidate: " + candidateSymbol,
+		Price: weakest.sig.Price, EMAFast: weakest.sig.EMAFast, EMASlow: weakest.sig.EMASlow,
+	})
+	delete(positions, weakest.symbol)
 }
 
 // symbolsToScan returns the static watchlist, or — in dynamic-universe mode

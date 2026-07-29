@@ -33,6 +33,15 @@ type Config struct {
 	MaxPositionPct    float64 // max % of equity in a single position
 	MaxPositions      int     // max number of concurrent open positions
 	DailyLossLimitPct float64 // halt new entries / flatten if equity drawdown exceeds this in a day
+
+	// EnableRotation, when true and every MAX_POSITIONS slot is full, lets
+	// the engine close the weakest held position in favor of a clearly
+	// stronger candidate rather than only ever exiting via stop/take. Off by
+	// default: unlike the rest of the exit logic, this hasn't been
+	// backtested (see README) and adds turnover a stop/take-only strategy
+	// doesn't have.
+	EnableRotation bool
+	RotationMargin float64 // how much stronger (in TrendStrength) a candidate must be to justify swapping
 }
 
 // loadDotEnv reads KEY=VALUE pairs from path into the process environment,
@@ -161,6 +170,9 @@ func Load() (*Config, error) {
 	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 100.0)
 	cfg.MaxPositions = getInt("MAX_POSITIONS", 5)
 	cfg.DailyLossLimitPct = getFloat("DAILY_LOSS_LIMIT_PCT", 3.0)
+
+	cfg.EnableRotation = strings.EqualFold(strings.TrimSpace(os.Getenv("ENABLE_ROTATION")), "true")
+	cfg.RotationMargin = getFloat("ROTATION_MARGIN", 0.01)
 
 	// Hard safety floor: position-protection and account-state checks are
 	// non-negotiable every tick, so POLL_INTERVAL can never go fast enough to
