@@ -15,6 +15,7 @@ import (
 	"tradebot/internal/config"
 	"tradebot/internal/decisionlog"
 	"tradebot/internal/indicators"
+	"tradebot/internal/ratelimit"
 	"tradebot/internal/risk"
 	"tradebot/internal/strategy"
 	"tradebot/internal/timeframe"
@@ -38,6 +39,7 @@ type Engine struct {
 
 	currentUniverse []string // symbols actually scanned this run (static watchlist, or today's dynamic shortlist)
 	universeDate    string   // calendar date currentUniverse was computed for, when dynamic
+	scanOffset      int      // round-robin position into currentUniverse for candidate-scan throttling
 
 	dayStartEquity float64
 	dayStartDate   string
@@ -190,25 +192,51 @@ func (e *Engine) tick(ctx context.Context) {
 		return
 	}
 
-	// Pass 1: evaluate every candidate not already held/pending, and collect
-	// the ones whose signal says to enter. Nothing gets bought yet — this is
+	// Sort candidates needing an actual bars-fetch call away from ones we can
+	// skip for free (already held or already have a pending order) — only
+	// the former count against the rate-limit scan budget below. Protecting
+	// what's already held stays completely unaffected by any of this: it
+	// already ran in full, above, before this function even looked at
+	// candidates.
+	var toScan []string
+	for _, symbol := range symbols {
+		if positions[symbol] || openOrders[symbol] {
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "already_held_or_pending"})
+			continue
+		}
+		toScan = append(toScan, symbol)
+	}
+
+	// Rate-limit budget: only scan as many candidates this tick as is safe
+	// at the current poll interval, rotating through the rest so everything
+	// still gets covered over subsequent ticks. Position protection above
+	// was never part of this budget and always runs in full regardless.
+	maxScan := ratelimit.MaxCandidatesPerTick(e.cfg.PollInterval, e.cfg.MaxPositions)
+	window, rest := rotatingWindow(toScan, e.scanOffset, maxScan)
+	if len(rest) > 0 {
+		slog.Info("rate-limit budget: scanning a subset of candidates this tick, rotating through the rest",
+			"scanning", len(window), "deferred", len(rest), "total_candidates", len(toScan))
+		for _, symbol := range rest {
+			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "deferred_rate_limit_rotation"})
+		}
+	}
+	e.scanOffset = (e.scanOffset + len(window)) % max(len(toScan), 1)
+
+	// Pass 1: evaluate this tick's window of candidates, and collect the
+	// ones whose signal says to enter. Nothing gets bought yet — this is
 	// just gathering the field before ranking it.
 	type candidate struct {
 		symbol string
 		sig    strategy.Signal
 	}
 	var candidates []candidate
-	for _, symbol := range symbols {
+	for _, symbol := range window {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
-		if positions[symbol] || openOrders[symbol] {
-			e.decisionLog.Log(decisionlog.Decision{Symbol: symbol, Action: decisionlog.Skip, Reason: "already_held_or_pending"})
-			continue
-		}
 		sig, ok := e.evaluateSignal(symbol)
 		if !ok {
 			continue // evaluateSignal already logged why
@@ -487,6 +515,32 @@ func (e *Engine) rolloverDayIfNeeded(currentEquity float64) {
 		e.haltedToday = false
 		slog.Info("new trading day", "date", today, "start_equity", currentEquity)
 	}
+}
+
+// rotatingWindow returns up to n symbols starting at offset (wrapping
+// around), plus everything left out, so repeated calls with an advancing
+// offset eventually cover the whole list instead of always favoring the
+// symbols earliest in it.
+func rotatingWindow(symbols []string, offset, n int) (window, rest []string) {
+	if len(symbols) == 0 {
+		return nil, nil
+	}
+	if n >= len(symbols) {
+		return symbols, nil
+	}
+	offset %= len(symbols)
+	inWindow := make(map[int]bool, n)
+	for i := 0; i < n; i++ {
+		idx := (offset + i) % len(symbols)
+		window = append(window, symbols[idx])
+		inWindow[idx] = true
+	}
+	for i, s := range symbols {
+		if !inWindow[i] {
+			rest = append(rest, s)
+		}
+	}
+	return window, rest
 }
 
 // sleepCtx sleeps for d or until ctx is cancelled, returning false if cancelled.

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"tradebot/internal/ratelimit"
 	"tradebot/internal/timeframe"
 )
 
@@ -160,6 +161,18 @@ func Load() (*Config, error) {
 	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 100.0)
 	cfg.MaxPositions = getInt("MAX_POSITIONS", 5)
 	cfg.DailyLossLimitPct = getFloat("DAILY_LOSS_LIMIT_PCT", 3.0)
+
+	// Hard safety floor: position-protection and account-state checks are
+	// non-negotiable every tick, so POLL_INTERVAL can never go fast enough to
+	// risk not being able to afford them, regardless of timeframe, universe
+	// size, or an explicit override. Candidate scanning (which does scale
+	// with universe size) is throttled separately in the engine instead of
+	// by slowing this down further — see internal/ratelimit.
+	if floor := ratelimit.MinPollInterval(cfg.MaxPositions); cfg.PollInterval < floor {
+		fmt.Fprintf(os.Stderr, "WARNING: POLL_INTERVAL %s is below the rate-limit safety floor for MAX_POSITIONS=%d (%s) — raising it to the floor.\n",
+			cfg.PollInterval, cfg.MaxPositions, floor)
+		cfg.PollInterval = floor
+	}
 
 	if !strings.Contains(cfg.BaseURL, "paper-api") {
 		fmt.Fprintln(os.Stderr, "WARNING: APCA_API_BASE_URL does not look like the paper trading endpoint. Refusing to run against a live-money endpoint from this bot.")
