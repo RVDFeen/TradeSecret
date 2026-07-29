@@ -107,6 +107,14 @@ the image (`.dockerignore` excludes it from the build context too). The bar
 cache persists across restarts in a named volume (`tradebot-cache`), so you
 don't lose it every time the container restarts.
 
+The compose file builds straight from
+[github.com/RVDFeen/TradeSecret](https://github.com/RVDFeen/TradeSecret)
+(`main` branch, at build time) rather than the local directory — so deploying
+somewhere else is just copying `docker-compose.yml` and `.env`, nothing else.
+If you're actively editing the code locally, change `build:` to `.` in
+`docker-compose.yml` so your uncommitted changes get built instead of what's
+on GitHub.
+
 ## Usage
 
 ```
