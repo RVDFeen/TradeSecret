@@ -82,6 +82,18 @@ func getInt(key string, def int) int {
 	return i
 }
 
+// defaultPollInterval picks a sensible poll cadence for a timeframe: fast
+// enough to notice a new bar promptly, without polling far more often than
+// the signal itself can possibly change.
+func defaultPollInterval(tf timeframe.Timeframe) time.Duration {
+	switch tf.Unit {
+	case timeframe.Minute:
+		return 30 * time.Second
+	default: // Hour, Day
+		return 15 * time.Minute
+	}
+}
+
 // Load reads .env (if present) and environment variables into a Config.
 func Load() (*Config, error) {
 	_ = loadDotEnv(".env")
@@ -109,16 +121,6 @@ func Load() (*Config, error) {
 		}
 	}
 
-	pollRaw := os.Getenv("POLL_INTERVAL")
-	if pollRaw == "" {
-		pollRaw = "15m"
-	}
-	d, err := time.ParseDuration(pollRaw)
-	if err != nil {
-		return nil, fmt.Errorf("invalid POLL_INTERVAL %q: %w", pollRaw, err)
-	}
-	cfg.PollInterval = d
-
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("STRATEGY_TIMEFRAME"))) {
 	case "", "hourly", "hour":
 		cfg.Timeframe = timeframe.OneHour
@@ -129,6 +131,19 @@ func Load() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("invalid STRATEGY_TIMEFRAME %q: must be \"minute\", \"hourly\", or \"daily\"", os.Getenv("STRATEGY_TIMEFRAME"))
 	}
+
+	// POLL_INTERVAL's default tracks the timeframe (so switching timeframe
+	// doesn't silently leave polling mismatched to it) but an explicit
+	// POLL_INTERVAL always wins, at any timeframe.
+	pollRaw := os.Getenv("POLL_INTERVAL")
+	if pollRaw == "" {
+		pollRaw = defaultPollInterval(cfg.Timeframe).String()
+	}
+	d, err := time.ParseDuration(pollRaw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid POLL_INTERVAL %q: %w", pollRaw, err)
+	}
+	cfg.PollInterval = d
 
 	cfg.RiskPerTradePct = getFloat("RISK_PER_TRADE_PCT", 1.0)
 	cfg.MaxPositionPct = getFloat("MAX_POSITION_PCT", 100.0)
