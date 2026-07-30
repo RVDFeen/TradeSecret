@@ -299,7 +299,7 @@ func (e *Engine) tick(ctx context.Context) {
 			noteUnfilled(candidates[i])
 			break
 		}
-		if e.enterPosition(c.symbol, c.sig, acc) {
+		if e.enterPosition(c.symbol, c.sig, &acc) {
 			// Mark it held immediately: len(positions) is what the guard
 			// above checks, and it must reflect entries placed earlier in
 			// this very pass — otherwise the position cap only works across
@@ -454,7 +454,11 @@ func (e *Engine) evaluateSignal(symbol string) (strategy.Signal, bool) {
 
 // enterPosition sizes and places an entry order for a symbol whose signal
 // already said to enter, returning true if an order was actually submitted.
-func (e *Engine) enterPosition(symbol string, sig strategy.Signal, acc broker.AccountSnapshot) bool {
+// acc is a pointer because BuyingPower is drawn down on a successful order —
+// otherwise every candidate in a multi-entry tick sizes against the same
+// stale pre-tick figure and later ones get rejected by Alpaca for buying
+// power the earlier ones already spent.
+func (e *Engine) enterPosition(symbol string, sig strategy.Signal, acc *broker.AccountSnapshot) bool {
 	signalDecision := decisionlog.Decision{
 		Symbol: symbol, Price: sig.Price, EMAFast: sig.EMAFast, EMASlow: sig.EMASlow,
 		RSI: sig.RSI, ATR: sig.ATR, Uptrend: decisionlog.Bool(sig.Uptrend), Momentum: decisionlog.Bool(sig.Momentum),
@@ -501,6 +505,10 @@ func (e *Engine) enterPosition(symbol string, sig strategy.Signal, acc broker.Ac
 	signalDecision.Action, signalDecision.Reason = decisionlog.Enter, "signal"
 	signalDecision.Qty, signalDecision.Stop, signalDecision.Take, signalDecision.OrderID = float64(qty), stopPrice, takePrice, order.ID
 	e.decisionLog.Log(signalDecision)
+	// Draw down the shared snapshot so the next candidate ranked in this same
+	// tick sizes against what's actually left, not what was available before
+	// this order spent it.
+	acc.BuyingPower -= float64(qty) * price
 	return true
 }
 
