@@ -41,9 +41,8 @@ type Engine struct {
 	universeDate    string   // calendar date currentUniverse was computed for, when dynamic
 	scanOffset      int      // round-robin position into currentUniverse for candidate-scan throttling
 
-	dayStartEquity float64
-	dayStartDate   string
-	haltedToday    bool
+	dayStartDate string
+	haltedToday  bool
 }
 
 func New(cfg *config.Config, b *broker.Broker) (*Engine, error) {
@@ -152,11 +151,11 @@ func (e *Engine) tick(ctx context.Context) {
 		slog.Error("get account failed", "err", err)
 		return
 	}
-	e.rolloverDayIfNeeded(acc.Equity)
+	e.rolloverDayIfNeeded()
 
-	if e.risk.DailyLossBreached(e.dayStartEquity, acc.Equity) && !e.haltedToday {
+	if e.risk.DailyLossBreached(acc.LastEquity, acc.Equity) && !e.haltedToday {
 		slog.Warn("daily loss limit breached — halting new entries and cancelling open orders for the rest of the day",
-			"day_start_equity", e.dayStartEquity, "current_equity", acc.Equity)
+			"day_start_equity", acc.LastEquity, "current_equity", acc.Equity)
 		if err := e.broker.CancelAllOrders(); err != nil {
 			slog.Error("cancel all orders failed", "err", err)
 		}
@@ -617,13 +616,12 @@ func (e *Engine) logNewFills() {
 	}
 }
 
-func (e *Engine) rolloverDayIfNeeded(currentEquity float64) {
+func (e *Engine) rolloverDayIfNeeded() {
 	today := time.Now().Format("2006-01-02")
 	if e.dayStartDate != today {
 		e.dayStartDate = today
-		e.dayStartEquity = currentEquity
 		e.haltedToday = false
-		slog.Info("new trading day", "date", today, "start_equity", currentEquity)
+		slog.Info("new trading day", "date", today)
 	}
 }
 

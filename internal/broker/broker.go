@@ -124,6 +124,11 @@ type AccountSnapshot struct {
 	Equity      float64
 	Cash        float64
 	BuyingPower float64
+	// LastEquity is Alpaca's own equity-as-of-previous-trading-day's-close —
+	// authoritative and server-side, unlike a same-process "day start
+	// equity" that a restart would reset to whatever equity exists at that
+	// moment instead of the actual start of the trading day.
+	LastEquity float64
 }
 
 func (b *Broker) GetAccount() (AccountSnapshot, error) {
@@ -134,7 +139,8 @@ func (b *Broker) GetAccount() (AccountSnapshot, error) {
 	equity, _ := acc.Equity.Float64()
 	cash, _ := acc.Cash.Float64()
 	bp, _ := acc.BuyingPower.Float64()
-	return AccountSnapshot{Equity: equity, Cash: cash, BuyingPower: bp}, nil
+	lastEquity, _ := acc.LastEquity.Float64()
+	return AccountSnapshot{Equity: equity, Cash: cash, BuyingPower: bp, LastEquity: lastEquity}, nil
 }
 
 // GetBarsRange returns completed bars of the given timeframe for symbol
